@@ -1,0 +1,45 @@
+using Controlcenter.Endpoints;
+using Controlcenter.Services;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Single pod, single instance of every sink. Memory budget for the whole pod
+// targets ≤ 100 MB managed at idle:
+//   - Journal: ~3 MB (channel + buffered gzip stream)
+//   - Ring buffer: ~512 KB
+//   - Aggregator: O(active jobs), bounded by stale sweep
+//   - Subscribers: ~128 KB per open browser tab
+//   - .NET runtime: ~50–60 MB
+builder.Services.AddSingleton<JournalWriter>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<JournalWriter>());
+builder.Services.AddSingleton<JobEventRingBuffer>(_ => new JobEventRingBuffer(2000));
+builder.Services.AddSingleton<LiveBroadcaster>();
+builder.Services.AddSingleton<JobAggregator>();
+
+builder.Services.AddGrpc(options =>
+{
+    options.MaxReceiveMessageSize = 4 * 1024 * 1024;
+    options.MaxSendMessageSize = 1 * 1024 * 1024;
+});
+
+// Kestrel: HTTP/2 (gRPC) on 5000, HTTP/1 (UI + REST + SSE) on 5001.
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.ListenAnyIP(5000, o => o.Protocols = HttpProtocols.Http2);
+    options.ListenAnyIP(5001, o => o.Protocols = HttpProtocols.Http1);
+    options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(10);
+    options.Limits.Http2.KeepAlivePingDelay = TimeSpan.FromSeconds(30);
+});
+
+var app = builder.Build();
+
+app.UseDefaultFiles();
+app.UseStaticFiles();
+app.UseRouting();
+
+app.MapGrpcService<JobEventReceiverService>();
+app.MapApi();
+app.MapGet("/", () => Results.Redirect("/index.html"));
+
+app.Run();
