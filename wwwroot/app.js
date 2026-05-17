@@ -95,6 +95,46 @@ function renderActive(jobs) {
   root.innerHTML = html;
 }
 
+// ── Fleet runtime stats ────────────────────────────────────────────────
+async function refreshFleet() {
+  try {
+    const r = await fetch("/api/fleet");
+    if (!r.ok) return;
+    const fleet = await r.json();
+    const body = $("fleetBody");
+    const empty = $("fleetEmpty");
+    if (!fleet.length) {
+      body.innerHTML = "";
+      empty.style.display = "";
+      return;
+    }
+    empty.style.display = "none";
+
+    body.innerHTML = fleet.map((f) => {
+      const stale = (f.age_sec || 0) > 90;
+      const fragPct = (f.heap_fragment_ratio || 0) * 100;
+      const fragClass = fragPct >= 50 ? "err" : fragPct >= 30 ? "warn" : "num";
+      const ageClass = stale ? "err" : "num";
+      const errBadge = f.error ? `<span class="stale-tag" title="${f.error}">${f.error.substring(0,28)}</span>` : "";
+      const podLabel = f.pod ? f.pod.split("-").slice(-2).join("-") : (f.ip || "?");
+      return `
+        <tr>
+          <td><span style="color:var(--accent-2)">${f.component}</span></td>
+          <td><span class="pod-name" title="${f.pod || ""}">${podLabel}</span>${errBadge}</td>
+          <td class="dim">${f.node || ""}</td>
+          <td class="num">${fmtBytes(f.heap_size_bytes)}</td>
+          <td class="num ${fragClass}">${fragPct.toFixed(1)}%</td>
+          <td class="num">${fmtBytes(f.loh_size)}</td>
+          <td class="num">${fmtBytes(f.rss_bytes)}</td>
+          <td class="num">${fmtBytes(f.native_overhead_bytes)}</td>
+          <td class="num">${fmtNum(f.gen2_collections)}</td>
+          <td class="num ${ageClass}">${Math.round(f.age_sec || 0)}s</td>
+        </tr>
+      `;
+    }).join("");
+  } catch (e) { /* ignore */ }
+}
+
 // ── Files list ─────────────────────────────────────────────────────────
 async function refreshFiles() {
   try {
@@ -202,8 +242,9 @@ $("pauseBtn").addEventListener("click", () => {
 });
 
 (async function init() {
-  await Promise.all([loadInitialTape(), refreshSnapshot(), refreshFiles()]);
+  await Promise.all([loadInitialTape(), refreshSnapshot(), refreshFiles(), refreshFleet()]);
   connectSse();
   setInterval(refreshSnapshot, 2000);
   setInterval(refreshFiles, 15000);
+  setInterval(refreshFleet, 10000);
 })();

@@ -61,6 +61,31 @@
 
   <section class="panel">
     <div class="panel-head">
+      <h2>fleet health</h2>
+      <span class="hint">heap / fragmentation / RSS per pod, scraped every 30 s — flag &gt; 30% frag or stale &gt; 90 s</span>
+    </div>
+    <table class="fleet">
+      <thead>
+        <tr>
+          <th>component</th>
+          <th>pod</th>
+          <th>node</th>
+          <th>heap</th>
+          <th>frag%</th>
+          <th>LOH</th>
+          <th>RSS</th>
+          <th>native</th>
+          <th>gen2</th>
+          <th>last</th>
+        </tr>
+      </thead>
+      <tbody id="fleetBody"></tbody>
+    </table>
+    <div id="fleetEmpty" class="empty">no fleet samples yet — first scrape is in &lt;30 s</div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
       <h2>journal files</h2>
       <span class="hint">gzipped NDJSON, 7-day retention; download for offline analysis</span>
     </div>

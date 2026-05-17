@@ -205,11 +205,39 @@ body {
 .tape .id { color: var(--fg-mute); }
 .tape .detail { color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.files {
+.fleet, .files {
   width: 100%;
   border-collapse: collapse;
   font-family: var(--mono);
   font-size: 11px;
+}
+.fleet th, .fleet td { padding: 6px 12px; }
+.fleet th {
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  color: var(--fg-mute);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 1px;
+}
+.fleet td { border-bottom: 1px solid rgba(31,39,49,0.5); color: var(--fg); white-space: nowrap; }
+.fleet tr:last-child td { border-bottom: none; }
+.fleet td.num { font-variant-numeric: tabular-nums; text-align: right; }
+.fleet td.warn { color: var(--warn); }
+.fleet td.err  { color: var(--err); }
+.fleet td.dim  { color: var(--fg-dim); }
+.fleet td .pod-name { color: var(--accent); }
+.fleet td .stale-tag {
+  display: inline-block;
+  padding: 1px 5px;
+  margin-left: 6px;
+  border-radius: 2px;
+  background: rgba(255, 107, 107, 0.15);
+  color: var(--err);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
 }
 .files th {
   text-align: left;

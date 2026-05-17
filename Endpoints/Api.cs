@@ -124,6 +124,58 @@ public static class Api
             catch (InvalidOperationException) { return Results.BadRequest(); }
         });
 
+        // ── Fleet runtime stats (per-pod heap / fragmentation / RSS) ───
+        app.MapGet("/api/fleet", (RuntimeStatsStore store) =>
+        {
+            var fleet = store.CurrentFleet();
+            var now = DateTime.UtcNow;
+            return Results.Json(fleet.Select(s => new
+            {
+                component               = s.Component,
+                pod                     = s.Pod,
+                node                    = s.Node,
+                ip                      = s.ScrapedFromIp,
+                ts_unix_ms              = s.TsUnixMs,
+                age_sec                 = (now - s.UpdatedUtc).TotalSeconds,
+                error                   = s.Error,
+                heap_size_bytes         = s.HeapSizeBytes,
+                heap_committed_bytes    = s.HeapCommittedBytes,
+                heap_fragmented_bytes   = s.HeapFragmentedBytes,
+                heap_fragment_ratio     = s.HeapSizeBytes > 0
+                                            ? (double)s.HeapFragmentedBytes / s.HeapSizeBytes : 0.0,
+                gen0_size               = s.Gen0Size,
+                gen1_size               = s.Gen1Size,
+                gen2_size               = s.Gen2Size,
+                loh_size                = s.LohSize,
+                loh_fragmented_bytes    = s.LohFragmentedBytes,
+                poh_size                = s.PohSize,
+                gen0_collections        = s.Gen0Collections,
+                gen1_collections        = s.Gen1Collections,
+                gen2_collections        = s.Gen2Collections,
+                rss_bytes               = s.RssBytes,
+                private_bytes           = s.PrivateBytes,
+                memory_load_bytes       = s.MemoryLoadBytes,
+                memory_load_threshold   = s.MemoryLoadThreshold,
+                native_overhead_bytes   = s.NativeOverheadBytes,
+            }), _json);
+        });
+
+        // ── Per-pod history (rolling 1h at default cadence) ────────────
+        app.MapGet("/api/fleet/{component}/{podOrIp}/history",
+            (RuntimeStatsStore store, string component, string podOrIp, int? max) =>
+        {
+            var samples = store.History(component, podOrIp, Math.Clamp(max ?? 120, 1, 1000));
+            return Results.Json(samples.Select(s => new
+            {
+                ts_unix_ms              = s.TsUnixMs,
+                heap_size_bytes         = s.HeapSizeBytes,
+                heap_fragmented_bytes   = s.HeapFragmentedBytes,
+                rss_bytes               = s.RssBytes,
+                gen2_collections        = s.Gen2Collections,
+                native_overhead_bytes   = s.NativeOverheadBytes,
+            }), _json);
+        });
+
         // ── Health ─────────────────────────────────────────────────────
         app.MapGet("/health", () => Results.Ok("ok"));
         app.MapGet("/ready", () => Results.Ok("ready"));

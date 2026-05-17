@@ -17,6 +17,13 @@ builder.Services.AddSingleton<JobEventRingBuffer>(_ => new JobEventRingBuffer(20
 builder.Services.AddSingleton<LiveBroadcaster>();
 builder.Services.AddSingleton<JobAggregator>();
 
+// Pull-based fleet health: the scraper resolves headless service DNS for
+// agent / cross / gateway and hits each pod's /stats/runtime every 30 s.
+// Workload pods don't push anything; if this scraper is offline they're
+// unaffected.
+builder.Services.AddSingleton<RuntimeStatsStore>();
+builder.Services.AddHostedService<RuntimeStatsScraper>();
+
 builder.Services.AddGrpc(options =>
 {
     options.MaxReceiveMessageSize = 4 * 1024 * 1024;
