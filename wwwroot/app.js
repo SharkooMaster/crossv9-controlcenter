@@ -52,6 +52,23 @@ async function refreshSnapshot() {
     $("kpi_refs").textContent = fmtNum(s.kpis.refs_found);
     $("kpi_avgms").textContent = fmtMs(s.kpis.avg_server_ms);
 
+    // ── Integrity panel ──
+    const checkedEl = $("kpi_int_checked");
+    const mismEl = $("kpi_int_mismatch");
+    const decEl = $("kpi_int_decompress");
+    checkedEl.textContent = fmtNum(s.kpis.integrity_checked);
+    mismEl.textContent = fmtNum(s.kpis.integrity_mismatches);
+    decEl.textContent = fmtNum(s.kpis.integrity_decompress_failures);
+    mismEl.classList.toggle("err", (s.kpis.integrity_mismatches || 0) > 0);
+    mismEl.classList.toggle("ok", (s.kpis.integrity_mismatches || 0) === 0 && (s.kpis.integrity_checked || 0) > 0);
+    decEl.classList.toggle("err", (s.kpis.integrity_decompress_failures || 0) > 0);
+    decEl.classList.toggle("ok", (s.kpis.integrity_decompress_failures || 0) === 0);
+    const lastDetail = s.kpis.integrity_last_detail;
+    const lastTs = s.kpis.integrity_last_ts_ns;
+    const lastEl = $("integrity_last");
+    if (lastDetail && lastTs) lastEl.textContent = `${fmtTs(lastTs)} · ${lastDetail}`;
+    else lastEl.textContent = "—";
+
     $("subs").textContent = s.bus.sse_subscribers;
     $("journalBytes").textContent = fmtBytes(s.journal.bytes_written);
     $("journalDrop").textContent = fmtNum(s.journal.dropped);
@@ -167,17 +184,35 @@ function pushTape(ev) {
   tape.unshift(ev);
   if (tape.length > TAPE_MAX) tape.length = TAPE_MAX;
   renderTape();
+  // Keep the pulse view's mono tape in sync when it's the visible page.
+  // pulseTape is rendered lazily — we only redraw when its container is on.
+  const pulseEl = document.getElementById("view-pulse");
+  if (pulseEl && !pulseEl.hidden && typeof renderPulseTape === "function") {
+    renderPulseTape();
+  }
 }
 
 function renderTape() {
   const html = tape.map((ev) => {
     let detail = "";
+    let extraClass = "";
     switch (ev.phase) {
       case "Started":
         detail = `${ev.mode} · ${fmtBytes(ev.original_size)} · ${ev.file_name || ""}`;
         break;
       case "StageDone":
-        detail = `${ev.stage} · ${fmtMs(ev.stage_ms)}`;
+        if (ev.stage && ev.stage.indexOf("IntegrityCheck:") === 0) {
+          // stage_attr_chunk_count is reused as "checked",
+          // stage_attr_bucket_count is reused as "mismatches" by IntegrityDiagnostics.
+          const checked = ev.stage_attr_chunk_count || 0;
+          const mism = ev.stage_attr_bucket_count || 0;
+          detail = mism > 0
+            ? `❌ ${ev.stage.replace("IntegrityCheck:","")} · ${mism}/${checked} MISMATCH · ${fmtMs(ev.stage_ms)}`
+            : `✓ ${ev.stage.replace("IntegrityCheck:","")} · ${checked} ok · ${fmtMs(ev.stage_ms)}`;
+          extraClass = mism > 0 ? "integrity-bad" : "integrity-ok";
+        } else {
+          detail = `${ev.stage} · ${fmtMs(ev.stage_ms)}`;
+        }
         break;
       case "BlockDone":
         detail = `block ${ev.block_index + 1}/${ev.block_count} · ${fmtBytes(ev.block_bytes_in)}→${fmtBytes(ev.block_bytes_out)} · ${ev.block_refs_found}refs · ${fmtMs(ev.block_ms)}`;
@@ -187,10 +222,11 @@ function renderTape() {
         break;
       case "Failed":
         detail = `${ev.error_class || "?"} · ${(ev.error_message || "").substring(0, 80)}`;
+        if (ev.error_class === "INTEGRITY_DECOMPRESS") extraClass = "integrity-bad";
         break;
     }
     const phaseUpper = (ev.phase || "").replace(/([a-z])([A-Z])/g, "$1_$2").toUpperCase();
-    return `<div class="row">
+    return `<div class="row ${extraClass}">
       <span class="ts">${fmtTs(ev.ts_ns)}</span>
       <span class="phase ${phaseUpper}">${phaseUpper}</span>
       <span class="id" title="${ev.job_id}">${shortJob(ev.job_id)}</span>
@@ -234,6 +270,202 @@ function connectSse() {
   };
 }
 
+// ── Pulse view ─────────────────────────────────────────────────────────
+// Rolling throughput sample. We keep the last few snapshots and compute
+// bytes-in / bytes-out / completed deltas over the window so the pulse view
+// can show meaningful "right now" numbers instead of just totals since boot.
+const PULSE_WINDOW_MS = 60_000;
+const pulseStartedAt = Date.now();
+const pulseHistory = [];
+
+function pulsePushSample(s) {
+  const t = Date.now();
+  pulseHistory.push({
+    t,
+    bin: Number(s.kpis.bytes_in || 0),
+    bout: Number(s.kpis.bytes_out || 0),
+    completed: Number(s.kpis.completed || 0),
+  });
+  while (pulseHistory.length > 1 && pulseHistory[0].t < t - PULSE_WINDOW_MS) {
+    pulseHistory.shift();
+  }
+}
+
+function pulseThroughput() {
+  if (pulseHistory.length < 2) return { binPerSec: 0, boutPerSec: 0, filesPerMin: 0 };
+  const first = pulseHistory[0];
+  const last = pulseHistory[pulseHistory.length - 1];
+  const dt = Math.max(1, (last.t - first.t) / 1000);
+  return {
+    binPerSec: Math.max(0, (last.bin - first.bin) / dt),
+    boutPerSec: Math.max(0, (last.bout - first.bout) / dt),
+    filesPerMin: Math.max(0, ((last.completed - first.completed) / dt) * 60),
+  };
+}
+
+function fmtRate(bytesPerSec) {
+  if (!bytesPerSec || !isFinite(bytesPerSec)) return "— /s";
+  return fmtBytes(bytesPerSec) + "/s";
+}
+
+function fmtUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  const pad = (x) => String(x).padStart(2, "0");
+  return `${pad(h)}:${pad(m)}:${pad(ss)}`;
+}
+
+function fmtRatioGain(numerator, denominator) {
+  // Returns "x.xx×" — how much bigger the numerator is vs denominator.
+  // Use case: ccf / dc tells us "we returned X× more bytes than we kept".
+  if (!denominator || denominator <= 0) return "—";
+  const r = numerator / denominator;
+  if (!isFinite(r)) return "—";
+  if (r >= 10) return r.toFixed(1) + "×";
+  return r.toFixed(2) + "×";
+}
+
+function renderPulse(snapshot) {
+  pulsePushSample(snapshot);
+  const k = snapshot.kpis;
+
+  // hero row
+  $("pulseBytesIn").textContent = fmtBytes(k.bytes_in);
+  $("pulseBytesOut").textContent = fmtBytes(k.bytes_out);
+  $("pulseFiles").textContent = fmtNum(k.completed);
+  $("pulseBlocks").textContent = fmtNum(k.blocks);
+  $("pulseAvgMs").textContent = fmtMs(k.avg_server_ms);
+  $("pulseAvgMs2").textContent = fmtMs(k.avg_server_ms);
+  $("pulseActive").textContent = fmtNum(k.active_jobs);
+  $("pulseActive2").textContent = fmtNum(k.active_jobs);
+  $("pulseCRatio").textContent = fmtRatio(k.compress_ratio);
+
+  // datacenter spotlight
+  const dc = Number(k.bytes_dc || 0);
+  const ccf = Number(k.bytes_out || 0);
+  const bin = Number(k.bytes_in || 0);
+  $("pulseDc").textContent = fmtBytes(dc);
+  $("pulseCcf").textContent = fmtBytes(ccf);
+  $("pulseDcVsCcf").textContent = ccf > 0 ? (dc / ccf * 100).toFixed(1) + "%" : "—";
+  $("pulseDcVsIn").textContent = bin > 0 ? (dc / bin * 100).toFixed(1) + "%" : "—";
+
+  // "for every 1 GB ccf, we keep X bytes on dc"
+  const oneGb = 1024 * 1024 * 1024;
+  if (ccf > 0) {
+    const dcPerGbCcf = (dc / ccf) * oneGb;
+    $("pulseCcfUnit").textContent = "1.00 GB";
+    $("pulseDcUnit").textContent = fmtBytes(dcPerGbCcf);
+  } else {
+    $("pulseCcfUnit").textContent = "1.00 GB";
+    $("pulseDcUnit").textContent = "— B";
+  }
+
+  // dedup
+  const refs = Number(k.refs_found || 0);
+  const chunks = Number(k.chunks || 0);
+  const dedupPct = chunks > 0 ? (refs / chunks) * 100 : 0;
+  $("pulseDedupPct").textContent = chunks > 0 ? dedupPct.toFixed(1) + "%" : "—";
+  $("pulseRefs").textContent = fmtNum(refs);
+  $("pulseChunks").textContent = fmtNum(chunks);
+  $("pulseDedupFill").style.width = Math.min(100, dedupPct).toFixed(1) + "%";
+
+  // jobs
+  $("pulseStarted").textContent = fmtNum(k.started);
+  $("pulseCompleted").textContent = fmtNum(k.completed);
+  $("pulseCompleted2").textContent = fmtNum(k.completed);
+  $("pulseFailed").textContent = fmtNum(k.failed);
+
+  // integrity
+  const intChecked = Number(k.integrity_checked || 0);
+  const intMism = Number(k.integrity_mismatches || 0);
+  const intDec = Number(k.integrity_decompress_failures || 0);
+  $("pulseIntChecked").textContent = fmtNum(intChecked);
+  $("pulseIntMism").textContent = fmtNum(intMism);
+  $("pulseIntDec").textContent = fmtNum(intDec);
+  const intState = $("pulseIntegrityState");
+  if (intMism > 0 || intDec > 0) {
+    intState.textContent = "FAIL";
+    intState.className = "pcard-big mono err";
+  } else if (intChecked > 0) {
+    intState.textContent = "PASS";
+    intState.className = "pcard-big mono ok";
+  } else {
+    intState.textContent = "— —";
+    intState.className = "pcard-big mono";
+  }
+
+  // throughput
+  const t = pulseThroughput();
+  $("pulseTput").textContent = `${fmtRate(t.binPerSec)} → ${fmtRate(t.boutPerSec)}`;
+
+  // uptime
+  $("pulseUptime").textContent = fmtUptime(Date.now() - pulseStartedAt);
+}
+
+function renderPulseTape() {
+  // Reuse the existing tape buffer but render with mono-style row layout.
+  const slice = tape.slice(0, 30);
+  $("pulseTape").innerHTML = slice.map((ev) => {
+    let body = "";
+    let cls = "";
+    switch (ev.phase) {
+      case "Started":
+        body = `START   ${(ev.file_name || "").substring(0, 48).padEnd(48)} ${fmtBytes(ev.original_size).padStart(10)}`;
+        break;
+      case "BlockDone":
+        body = `BLOCK   ${String(ev.block_index + 1).padStart(3)}/${String(ev.block_count).padEnd(3)}   ${fmtBytes(ev.block_bytes_in).padStart(9)} → ${fmtBytes(ev.block_bytes_out).padStart(9)}   ${String(ev.block_refs_found).padStart(5)}refs   ${fmtMs(ev.block_ms)}`;
+        break;
+      case "StageDone":
+        if (ev.stage && ev.stage.indexOf("IntegrityCheck:") === 0) {
+          const mism = ev.stage_attr_bucket_count || 0;
+          const checked = ev.stage_attr_chunk_count || 0;
+          cls = mism > 0 ? "tx err" : "tx ok";
+          body = `INTEG   ${ev.stage.replace("IntegrityCheck:", "").padEnd(20)} ${mism > 0 ? "❌ " + mism + "/" + checked : "✓ " + checked}`;
+        } else {
+          body = `STAGE   ${(ev.stage || "").padEnd(30)} ${fmtMs(ev.stage_ms)}`;
+        }
+        break;
+      case "Completed":
+        cls = "tx ok";
+        body = `OK      ${fmtBytes(ev.compressed_size).padStart(10)} dc ${fmtBytes(ev.dc_bytes).padStart(10)}   ${String(ev.refs_found).padStart(5)}refs   ${fmtMs(ev.wall_ms)}`;
+        break;
+      case "Failed":
+        cls = "tx err";
+        body = `FAIL    ${(ev.error_class || "?").padEnd(24)} ${(ev.error_message || "").substring(0, 60)}`;
+        break;
+      default:
+        body = ev.phase;
+    }
+    return `<div class="ptape-row ${cls}"><span class="ptape-t">${fmtTs(ev.ts_ns)}</span>${body.replace(/ /g, "&nbsp;")}</div>`;
+  }).join("");
+}
+
+// ── View switching ─────────────────────────────────────────────────────
+function switchView(name) {
+  const buttons = document.querySelectorAll("#viewNav button");
+  buttons.forEach((b) => b.classList.toggle("active", b.dataset.view === name));
+  document.getElementById("view-operator").hidden = name !== "operator";
+  document.getElementById("view-pulse").hidden = name !== "pulse";
+  try { localStorage.setItem("crossv9.view", name); } catch (_) {}
+  if (name === "pulse") renderPulseTape();
+}
+
+document.querySelectorAll("#viewNav button").forEach((b) =>
+  b.addEventListener("click", () => switchView(b.dataset.view)));
+
+// Refresh snapshot for the pulse view too. We hook into the existing
+// refreshSnapshot via a side-channel: re-fetch on its cadence and render.
+async function refreshPulse() {
+  try {
+    const r = await fetch("/api/snapshot");
+    if (!r.ok) return;
+    const s = await r.json();
+    renderPulse(s);
+  } catch (e) { /* ignore */ }
+}
+
 // ── Wire up ────────────────────────────────────────────────────────────
 $("pauseBtn").addEventListener("click", () => {
   tapePaused = !tapePaused;
@@ -242,9 +474,16 @@ $("pauseBtn").addEventListener("click", () => {
 });
 
 (async function init() {
-  await Promise.all([loadInitialTape(), refreshSnapshot(), refreshFiles(), refreshFleet()]);
+  // Restore last selected view
+  try {
+    const last = localStorage.getItem("crossv9.view");
+    if (last === "pulse" || last === "operator") switchView(last);
+  } catch (_) {}
+
+  await Promise.all([loadInitialTape(), refreshSnapshot(), refreshPulse(), refreshFiles(), refreshFleet()]);
   connectSse();
   setInterval(refreshSnapshot, 2000);
+  setInterval(refreshPulse, 2000);
   setInterval(refreshFiles, 15000);
   setInterval(refreshFleet, 10000);
 })();

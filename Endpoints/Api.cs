@@ -41,6 +41,11 @@ public static class Api
                     dc_ratio = snap.TotalOriginalBytes > 0 ? (double)snap.TotalDcBytes / snap.TotalOriginalBytes : 0.0,
                     avg_server_ms = snap.TotalCompleted > 0 ? (double)snap.TotalServerMs / snap.TotalCompleted : 0.0,
                     active_jobs = snap.ActiveJobs.Length,
+                    integrity_checked = snap.IntegrityChecked,
+                    integrity_mismatches = snap.IntegrityMismatches,
+                    integrity_decompress_failures = snap.IntegrityDecompressFailures,
+                    integrity_last_ts_ns = snap.IntegrityLastTsNs,
+                    integrity_last_detail = snap.IntegrityLastDetail,
                 },
                 journal = new
                 {
@@ -160,6 +165,16 @@ public static class Api
             }), _json);
         });
 
+        // ── Manual fleet reset — drops every cached pod entry. Next scrape
+        //    cycle will repopulate only the pods that actually answer. Useful
+        //    after a heavy rolling restart when the operator doesn't want to
+        //    wait for the FLEET_EVICT_GRACE_SEC window to expire. ────────────
+        app.MapPost("/api/fleet/reset", (RuntimeStatsStore store) =>
+        {
+            int dropped = store.EvictStale(TimeSpan.Zero);
+            return Results.Json(new { dropped }, _json);
+        });
+
         // ── Per-pod history (rolling 1h at default cadence) ────────────
         app.MapGet("/api/fleet/{component}/{podOrIp}/history",
             (RuntimeStatsStore store, string component, string podOrIp, int? max) =>
@@ -194,6 +209,9 @@ public static class Api
         original_size = ev.OriginalSize,
         stage = string.IsNullOrEmpty(ev.Stage) ? null : ev.Stage,
         stage_ms = ev.StageMs,
+        stage_attr_chunk_count = ev.StageAttrChunkCount,
+        stage_attr_bucket_count = ev.StageAttrBucketCount,
+        stage_attr_bytes = ev.StageAttrBytes,
         block_index = ev.BlockIndex,
         block_count = ev.BlockCount,
         block_bytes_in = ev.BlockBytesIn,

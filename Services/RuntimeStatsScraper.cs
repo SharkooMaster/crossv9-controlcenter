@@ -81,14 +81,30 @@ public sealed class RuntimeStatsScraper : BackgroundService
             return;
         }
 
+        // Grace window before a pod that wasn't seen this cycle is evicted.
+        // Default = 3 × interval; minimum of 90s. Tuneable via env var so the
+        // operator can hide flapping pods longer if the cluster's DNS lags.
+        var graceSecRaw = Environment.GetEnvironmentVariable("FLEET_EVICT_GRACE_SEC");
+        var grace = int.TryParse(graceSecRaw, out var g) && g > 0
+            ? TimeSpan.FromSeconds(g)
+            : TimeSpan.FromSeconds(Math.Max(90, (int)_interval.TotalSeconds * 3));
+
         Console.WriteLine($"[FleetScraper] Targeting {_targets.Length} component(s): " +
-            string.Join(", ", _targets.Select(t => $"{t.component}={t.host}")));
+            string.Join(", ", _targets.Select(t => $"{t.component}={t.host}")) +
+            $"; interval={_interval.TotalSeconds:F0}s, evictGrace={grace.TotalSeconds:F0}s");
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                await ScrapeAllAsync(stoppingToken);
+                var aliveKeys = await ScrapeAllAsync(stoppingToken);
+                // Drop entries we didn't refresh this cycle that have also
+                // been stale longer than the grace window. New pod names from
+                // a rolling restart land in aliveKeys this cycle; the old
+                // pod's entry will fall out one grace window later.
+                int dropped = _store.Retain(aliveKeys, grace);
+                if (dropped > 0)
+                    Console.WriteLine($"[FleetScraper] Evicted {dropped} stale pod(s) (alive={aliveKeys.Count}, grace={grace.TotalSeconds:F0}s)");
             }
             catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
@@ -100,11 +116,18 @@ public sealed class RuntimeStatsScraper : BackgroundService
         }
     }
 
-    private async Task ScrapeAllAsync(CancellationToken ct)
+    private async Task<HashSet<string>> ScrapeAllAsync(CancellationToken ct)
     {
-        // Fan out across all targets concurrently. Each target's pods are also
-        // scraped in parallel. Per-pod failures are isolated; a single bad pod
-        // cannot stall the cycle.
+        // Each pod we touch this cycle records the store key it landed on so
+        // Retain() can decide what's still live versus what dropped out
+        // between cycles (rolling restart, pod evicted, node drained, etc.).
+        var alive = new HashSet<string>(StringComparer.Ordinal);
+        var aliveLock = new object();
+        void RecordAlive(string key)
+        {
+            lock (aliveLock) alive.Add(key);
+        }
+
         var tasks = new List<Task>(_targets.Length * 2);
         foreach (var (component, host) in _targets)
         {
@@ -116,26 +139,31 @@ public sealed class RuntimeStatsScraper : BackgroundService
             catch (Exception ex)
             {
                 Console.WriteLine($"[FleetScraper] DNS resolve failed for {host}: {ex.Message}");
-                _store.MarkError(component, host, null, $"dns: {ex.GetType().Name}");
+                // DNS failure is a transient component-level error; key it on
+                // the hostname so the dashboard surfaces ONE row, not one per
+                // historic IP, and so the entry expires naturally with the
+                // grace window if DNS stays broken.
+                RecordAlive(_store.MarkError(component, host, null, $"dns: {ex.GetType().Name}"));
                 continue;
             }
 
             if (ips.Length == 0)
             {
-                _store.MarkError(component, host, null, "dns: no records");
+                RecordAlive(_store.MarkError(component, host, null, "dns: no records"));
                 continue;
             }
 
             foreach (var ip in ips)
             {
-                tasks.Add(ScrapeOneAsync(component, ip.ToString(), ct));
+                tasks.Add(ScrapeOneAsync(component, ip.ToString(), RecordAlive, ct));
             }
         }
 
         await Task.WhenAll(tasks);
+        return alive;
     }
 
-    private async Task ScrapeOneAsync(string component, string ip, CancellationToken ct)
+    private async Task ScrapeOneAsync(string component, string ip, Action<string> recordAlive, CancellationToken ct)
     {
         var url = $"http://{ip}:{_port}/stats/runtime";
         try
@@ -143,22 +171,22 @@ public sealed class RuntimeStatsScraper : BackgroundService
             using var resp = await _http.GetAsync(url, HttpCompletionOption.ResponseContentRead, ct);
             if (!resp.IsSuccessStatusCode)
             {
-                _store.MarkError(component, ip, null, $"http {(int)resp.StatusCode}");
+                recordAlive(_store.MarkError(component, ip, null, $"http {(int)resp.StatusCode}"));
                 return;
             }
             await using var stream = await resp.Content.ReadAsStreamAsync(ct);
             var sample = await JsonSerializer.DeserializeAsync<RuntimeSample>(stream, _jsonOpts, ct);
             if (sample is null)
             {
-                _store.MarkError(component, ip, null, "deserialise: null");
+                recordAlive(_store.MarkError(component, ip, null, "deserialise: null"));
                 return;
             }
-            _store.UpdateOk(component, ip, sample);
+            recordAlive(_store.UpdateOk(component, ip, sample));
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { /* shutting down */ }
-        catch (TaskCanceledException) { _store.MarkError(component, ip, null, "timeout"); }
-        catch (HttpRequestException ex) { _store.MarkError(component, ip, null, $"http: {ex.Message}"); }
-        catch (Exception ex) { _store.MarkError(component, ip, null, $"{ex.GetType().Name}: {ex.Message}"); }
+        catch (TaskCanceledException) { recordAlive(_store.MarkError(component, ip, null, "timeout")); }
+        catch (HttpRequestException ex) { recordAlive(_store.MarkError(component, ip, null, $"http: {ex.Message}")); }
+        catch (Exception ex) { recordAlive(_store.MarkError(component, ip, null, $"{ex.GetType().Name}: {ex.Message}")); }
     }
 
     public override void Dispose()

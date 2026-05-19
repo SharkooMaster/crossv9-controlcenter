@@ -14,9 +14,9 @@ public sealed class RuntimeStatsStore
 
     private readonly ConcurrentDictionary<string, PodEntry> _byKey = new();
 
-    public void UpdateOk(string component, string ip, RuntimeSample sample)
+    public string UpdateOk(string component, string ip, RuntimeSample sample)
     {
-        var key = $"{component}|{sample.Pod ?? ip}";
+        var key = BuildKey(component, sample.Pod ?? ip);
         var entry = _byKey.GetOrAdd(key, _ => new PodEntry());
         entry.Apply(sample with
         {
@@ -25,13 +25,15 @@ public sealed class RuntimeStatsStore
             UpdatedUtc = DateTime.UtcNow,
             Error = null,
         });
+        return key;
     }
 
-    public void MarkError(string component, string ip, string? pod, string error)
+    public string MarkError(string component, string ip, string? pod, string error)
     {
-        var key = $"{component}|{pod ?? ip}";
+        var key = BuildKey(component, pod ?? ip);
         var entry = _byKey.GetOrAdd(key, _ => new PodEntry());
         entry.MarkError(component, ip, pod, error);
+        return key;
     }
 
     public IReadOnlyList<RuntimeSample> CurrentFleet()
@@ -51,6 +53,55 @@ public sealed class RuntimeStatsStore
         if (!_byKey.TryGetValue(key, out var e)) return Array.Empty<RuntimeSample>();
         return e.Snapshot(max);
     }
+
+    /// <summary>
+    /// Remove entries that haven't been refreshed for longer than
+    /// <paramref name="maxAge"/>. The scraper calls this once per cycle so
+    /// rolled / re-scheduled pods (which get fresh names) don't accumulate
+    /// forever in the dashboard.
+    /// </summary>
+    public int EvictStale(TimeSpan maxAge)
+    {
+        var cutoff = DateTime.UtcNow - maxAge;
+        int dropped = 0;
+        foreach (var (key, entry) in _byKey)
+        {
+            var latest = entry.Latest;
+            // An entry without a Latest sample was created speculatively (e.g.
+            // a DNS-failure MarkError) and never updated.  Treat that exactly
+            // the same as a stale one.
+            var lastSeen = latest?.UpdatedUtc ?? DateTime.MinValue;
+            if (lastSeen < cutoff && _byKey.TryRemove(key, out _))
+                dropped++;
+        }
+        return dropped;
+    }
+
+    /// <summary>
+    /// Limit retention to the set of (component, key) pairs we just observed
+    /// this cycle.  Anything not present in <paramref name="alive"/> AND older
+    /// than <paramref name="graceAge"/> is dropped immediately.  We keep the
+    /// grace age so a single missed scrape doesn't flicker a healthy pod off
+    /// the dashboard.
+    /// </summary>
+    public int Retain(HashSet<string> aliveKeys, TimeSpan graceAge)
+    {
+        var cutoff = DateTime.UtcNow - graceAge;
+        int dropped = 0;
+        foreach (var (key, entry) in _byKey)
+        {
+            if (aliveKeys.Contains(key)) continue;
+            var latest = entry.Latest;
+            var lastSeen = latest?.UpdatedUtc ?? DateTime.MinValue;
+            if (lastSeen < cutoff && _byKey.TryRemove(key, out _))
+                dropped++;
+        }
+        return dropped;
+    }
+
+    /// <summary>Stable lookup key used in storage (component|pod-or-ip).</summary>
+    internal static string BuildKey(string component, string podOrIp) =>
+        $"{component}|{podOrIp}";
 
     private sealed class PodEntry
     {

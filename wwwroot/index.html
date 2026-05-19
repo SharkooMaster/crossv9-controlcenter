@@ -13,6 +13,10 @@
       <span class="title">CrossV9</span>
       <span class="subtitle">control center</span>
     </div>
+    <nav class="viewnav" id="viewNav">
+      <button data-view="operator" class="active">operator</button>
+      <button data-view="pulse">pulse</button>
+    </nav>
     <div class="indicators">
       <span class="dot" id="liveDot" title="live stream"></span>
       <span id="liveLabel">connecting…</span>
@@ -25,6 +29,7 @@
     </div>
   </header>
 
+  <div class="view view-operator" id="view-operator">
   <section class="kpi-grid">
     <div class="kpi"><span class="kpi-k">started</span><span class="kpi-v" id="kpi_started">—</span></div>
     <div class="kpi"><span class="kpi-k">completed</span><span class="kpi-v ok" id="kpi_completed">—</span></div>
@@ -38,6 +43,20 @@
     <div class="kpi"><span class="kpi-k">dedup</span><span class="kpi-v" id="kpi_dedup">—</span></div>
     <div class="kpi"><span class="kpi-k">refs</span><span class="kpi-v" id="kpi_refs">—</span></div>
     <div class="kpi"><span class="kpi-k">avg server</span><span class="kpi-v" id="kpi_avgms">—</span></div>
+  </section>
+
+  <section class="panel integrity-panel">
+    <div class="panel-head">
+      <h2>integrity</h2>
+      <span class="hint">cross-side SHA256(chunkBytes) vs storage GUID round-trip; decompress per-block check</span>
+      <span class="spacer"></span>
+      <span class="metric"><span class="k">last</span><span class="v" id="integrity_last">—</span></span>
+    </div>
+    <div class="kpi-grid integrity-kpis">
+      <div class="kpi"><span class="kpi-k">verified</span><span class="kpi-v ok" id="kpi_int_checked">—</span></div>
+      <div class="kpi"><span class="kpi-k">compress mismatches</span><span class="kpi-v" id="kpi_int_mismatch">—</span></div>
+      <div class="kpi"><span class="kpi-k">decompress failures</span><span class="kpi-v" id="kpi_int_decompress">—</span></div>
+    </div>
   </section>
 
   <section class="panel">
@@ -94,6 +113,127 @@
       <tbody id="filesBody"></tbody>
     </table>
   </section>
+
+  </div><!-- /view-operator -->
+
+  <div class="view view-pulse" id="view-pulse" hidden>
+    <section class="pulse-hero">
+      <div class="pulse-corner tl">┌</div><div class="pulse-corner tr">┐</div>
+      <div class="pulse-corner bl">└</div><div class="pulse-corner br">┘</div>
+
+      <div class="pulse-title">
+        <span class="brk">[</span>
+        <span class="pulse-led" id="pulseLed"></span>
+        <span class="pulse-title-text">datacenter pulse</span>
+        <span class="pulse-uptime" id="pulseUptime">— uptime —</span>
+        <span class="brk">]</span>
+      </div>
+
+      <div class="pulse-flow">
+        <div class="pulse-flow-col input">
+          <div class="pulse-flow-label">INPUT</div>
+          <div class="pulse-flow-big" id="pulseBytesIn">— B</div>
+          <div class="pulse-flow-sub">
+            files <span id="pulseFiles">—</span>
+            · blocks <span id="pulseBlocks">—</span>
+          </div>
+        </div>
+
+        <div class="pulse-flow-arrow" id="pulseArrow1">━━▶</div>
+
+        <div class="pulse-flow-col compute">
+          <div class="pulse-flow-label">COMPUTE</div>
+          <div class="pulse-flow-big" id="pulseAvgMs">—</div>
+          <div class="pulse-flow-sub">
+            in-flight <span id="pulseActive">—</span>
+            · throughput <span id="pulseTput">—</span>
+          </div>
+        </div>
+
+        <div class="pulse-flow-arrow" id="pulseArrow2">━━▶</div>
+
+        <div class="pulse-flow-col output">
+          <div class="pulse-flow-label">RESPONSE</div>
+          <div class="pulse-flow-big" id="pulseBytesOut">— B</div>
+          <div class="pulse-flow-sub">
+            ccf/in <span id="pulseCRatio">—</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="pulse-spotlight">
+      <div class="ps-label">// datacenter footprint</div>
+      <div class="ps-row">
+        <div class="ps-cell">
+          <div class="ps-cell-k">stored on dc</div>
+          <div class="ps-cell-v big mono" id="pulseDc">— B</div>
+        </div>
+        <div class="ps-cell">
+          <div class="ps-cell-k">ccf returned</div>
+          <div class="ps-cell-v big mono" id="pulseCcf">— B</div>
+        </div>
+        <div class="ps-cell">
+          <div class="ps-cell-k">dc / ccf</div>
+          <div class="ps-cell-v big mono" id="pulseDcVsCcf">—</div>
+        </div>
+        <div class="ps-cell">
+          <div class="ps-cell-k">dc / original</div>
+          <div class="ps-cell-v big mono" id="pulseDcVsIn">—</div>
+        </div>
+      </div>
+      <div class="ps-explain">
+        for every <span class="hl" id="pulseCcfUnit">1.00 GB</span> of ccf we
+        respond with, we keep <span class="hl" id="pulseDcUnit">— B</span> on
+        the datacenter. every byte not stored is dedup or patch.
+      </div>
+    </section>
+
+    <section class="pulse-grid">
+      <div class="pcard">
+        <div class="pcard-h">// dedup signal</div>
+        <div class="pcard-big mono" id="pulseDedupPct">—</div>
+        <div class="pcard-sub">
+          <span id="pulseRefs">—</span> refs / <span id="pulseChunks">—</span> chunks
+        </div>
+        <div class="pcard-bar"><div class="pcard-fill" id="pulseDedupFill"></div></div>
+      </div>
+
+      <div class="pcard">
+        <div class="pcard-h">// jobs</div>
+        <div class="pcard-big mono">
+          <span class="ok" id="pulseCompleted">—</span>
+          /
+          <span id="pulseStarted">—</span>
+        </div>
+        <div class="pcard-sub">
+          failed <span class="err" id="pulseFailed">—</span>
+          · active <span id="pulseActive2">—</span>
+        </div>
+      </div>
+
+      <div class="pcard">
+        <div class="pcard-h">// integrity</div>
+        <div class="pcard-big mono" id="pulseIntegrityState">— —</div>
+        <div class="pcard-sub">
+          verified <span id="pulseIntChecked">—</span>
+          · mismatches <span id="pulseIntMism">—</span>
+          · decompress fail <span id="pulseIntDec">—</span>
+        </div>
+      </div>
+
+      <div class="pcard">
+        <div class="pcard-h">// avg latency</div>
+        <div class="pcard-big mono" id="pulseAvgMs2">—</div>
+        <div class="pcard-sub">across <span id="pulseCompleted2">—</span> jobs</div>
+      </div>
+    </section>
+
+    <section class="pulse-stream">
+      <div class="ps-label">// live events</div>
+      <div id="pulseTape" class="pulse-tape"></div>
+    </section>
+  </div><!-- /view-pulse -->
 
   <footer>
     <span>read-only operator console · single pod · drops events on overload, never blocks the compressor</span>

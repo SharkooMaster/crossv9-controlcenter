@@ -25,6 +25,17 @@ public sealed class JobAggregator
     private long _totalChunks;
     private long _totalServerMs;
 
+    // Integrity diagnostics:
+    //   _integrityChecked    — total (chunk,storageGuid) pairs the cross pods verified
+    //   _integrityMismatches — pairs where SHA256(chunkBytes) != storageGuid
+    //   _integrityDecompressFailures — count of FAILED events with error_class
+    //     "INTEGRITY_DECOMPRESS" since the controlcenter started
+    private long _integrityChecked;
+    private long _integrityMismatches;
+    private long _integrityDecompressFailures;
+    private long _integrityLastTsNs;
+    private string? _integrityLastDetail;
+
     private readonly ConcurrentDictionary<string, ActiveJob> _active = new();
 
     public sealed record ActiveJob(
@@ -47,6 +58,22 @@ public sealed class JobAggregator
             case JobPhase.StageDone:
                 if (_active.TryGetValue(ev.JobId, out var aStage))
                     _active[ev.JobId] = aStage with { LastStage = ev.Stage };
+
+                // Integrity diagnostics piggy-back on StageDone so they don't
+                // pollute the failed-jobs counter when the run is otherwise
+                // healthy. Stage names start with "IntegrityCheck:" and reuse
+                // stage_attr_chunk_count = checked, stage_attr_bucket_count = mismatches.
+                if (!string.IsNullOrEmpty(ev.Stage) && ev.Stage.StartsWith("IntegrityCheck:", StringComparison.Ordinal))
+                {
+                    if (ev.StageAttrChunkCount > 0)
+                        Interlocked.Add(ref _integrityChecked, ev.StageAttrChunkCount);
+                    if (ev.StageAttrBucketCount > 0)
+                    {
+                        Interlocked.Add(ref _integrityMismatches, ev.StageAttrBucketCount);
+                        Interlocked.Exchange(ref _integrityLastTsNs, (long)ev.TsUnixNs);
+                        _integrityLastDetail = ev.Stage;
+                    }
+                }
                 break;
 
             case JobPhase.BlockDone:
@@ -81,6 +108,12 @@ public sealed class JobAggregator
             case JobPhase.Failed:
                 Interlocked.Increment(ref _totalFailed);
                 _active.TryRemove(ev.JobId, out _);
+                if (ev.ErrorClass == "INTEGRITY_DECOMPRESS")
+                {
+                    Interlocked.Increment(ref _integrityDecompressFailures);
+                    Interlocked.Exchange(ref _integrityLastTsNs, (long)ev.TsUnixNs);
+                    _integrityLastDetail = $"decompress: {ev.ErrorMessage}";
+                }
                 break;
         }
 
@@ -113,6 +146,11 @@ public sealed class JobAggregator
             TotalRefsFound: Interlocked.Read(ref _totalRefsFound),
             TotalChunks: Interlocked.Read(ref _totalChunks),
             TotalServerMs: Interlocked.Read(ref _totalServerMs),
+            IntegrityChecked: Interlocked.Read(ref _integrityChecked),
+            IntegrityMismatches: Interlocked.Read(ref _integrityMismatches),
+            IntegrityDecompressFailures: Interlocked.Read(ref _integrityDecompressFailures),
+            IntegrityLastTsNs: Interlocked.Read(ref _integrityLastTsNs),
+            IntegrityLastDetail: _integrityLastDetail,
             ActiveJobs: active);
     }
 
@@ -127,5 +165,10 @@ public sealed class JobAggregator
         long TotalRefsFound,
         long TotalChunks,
         long TotalServerMs,
+        long IntegrityChecked,
+        long IntegrityMismatches,
+        long IntegrityDecompressFailures,
+        long IntegrityLastTsNs,
+        string? IntegrityLastDetail,
         ActiveJob[] ActiveJobs);
 }
