@@ -145,6 +145,9 @@ body {
 }
 .btn:hover { background: var(--line); }
 .btn.paused { color: var(--warn); border-color: var(--warn); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-reset { color: var(--warn); border-color: var(--warn); }
+.btn-reset:hover { background: var(--warn); color: var(--bg); }
 
 .active-list { max-height: 360px; overflow-y: auto; }
 .empty { padding: 28px; text-align: center; color: var(--fg-dim); font-family: var(--mono); font-size: 11px; }

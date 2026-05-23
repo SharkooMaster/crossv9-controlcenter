@@ -23,6 +23,13 @@ builder.Services.AddSingleton<JobAggregator>();
 // unaffected.
 builder.Services.AddSingleton<RuntimeStatsStore>();
 builder.Services.AddHostedService<RuntimeStatsScraper>();
+// Journals the latest fleet sample once per minute (cadence configurable via
+// FLEET_JOURNAL_INTERVAL_SEC) into the same daily gzip NDJSON file as job
+// events. The downloadable journal therefore contains both:
+//   - {"kind":"job_event", ...}    — pipeline activity
+//   - {"kind":"perf_sample", ...}  — heap / GC / threadpool / RocksDB / FD / cache / stage rollups
+// Filter post-hoc with `jq -c 'select(.kind == "perf_sample")'`.
+builder.Services.AddHostedService<FleetSampleJournaler>();
 
 builder.Services.AddGrpc(options =>
 {

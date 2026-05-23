@@ -30,11 +30,23 @@ public sealed class JobAggregator
     //   _integrityMismatches — pairs where SHA256(chunkBytes) != storageGuid
     //   _integrityDecompressFailures — count of FAILED events with error_class
     //     "INTEGRITY_DECOMPRESS" since the controlcenter started
+    //   _refRoundTripChecked / Mismatches / FetchFailures — RefRoundTrip is the
+    //     decompress-simulating integrity check (cross fetches each dedup-hit
+    //     ref via (BucketId, BucketKey) and compares the agent's response to
+    //     the bytes it diffed against). A mismatch here is the canonical
+    //     "your decompress will fail" signal and is tracked separately so
+    //     it's not lost among the hash-vs-guid round-trip counters.
     private long _integrityChecked;
     private long _integrityMismatches;
     private long _integrityDecompressFailures;
     private long _integrityLastTsNs;
     private string? _integrityLastDetail;
+
+    private long _refRoundTripChecked;
+    private long _refRoundTripMismatches;
+    private long _refRoundTripFetchFailures;
+    private long _refRoundTripLastTsNs;
+    private string? _refRoundTripLastDetail;
 
     private readonly ConcurrentDictionary<string, ActiveJob> _active = new();
 
@@ -72,6 +84,27 @@ public sealed class JobAggregator
                         Interlocked.Add(ref _integrityMismatches, ev.StageAttrBucketCount);
                         Interlocked.Exchange(ref _integrityLastTsNs, (long)ev.TsUnixNs);
                         _integrityLastDetail = ev.Stage;
+                    }
+
+                    // Pull RefRoundTrip into its own counters — it's the single
+                    // signal that actually predicts decompress failure (the
+                    // other stages catch internal bookkeeping bugs but a clean
+                    // round-trip across them does not guarantee decompress will
+                    // succeed). stage_attr_bytes carries the fetch-failure
+                    // sub-count from the emit site.
+                    if (ev.Stage == "IntegrityCheck:RefRoundTrip")
+                    {
+                        if (ev.StageAttrChunkCount > 0)
+                            Interlocked.Add(ref _refRoundTripChecked, ev.StageAttrChunkCount);
+                        if (ev.StageAttrBucketCount > 0)
+                        {
+                            Interlocked.Add(ref _refRoundTripMismatches, ev.StageAttrBucketCount);
+                            Interlocked.Exchange(ref _refRoundTripLastTsNs, (long)ev.TsUnixNs);
+                            _refRoundTripLastDetail =
+                                $"{ev.StageAttrBucketCount}/{ev.StageAttrChunkCount} mismatch";
+                        }
+                        if (ev.StageAttrBytes > 0)
+                            Interlocked.Add(ref _refRoundTripFetchFailures, (long)ev.StageAttrBytes);
                     }
                 }
                 break;
@@ -132,6 +165,41 @@ public sealed class JobAggregator
         }
     }
 
+    /// <summary>
+    /// Zeroes every cumulative counter and drops the in-flight set. Exposed via
+    /// POST /api/reset so the operator can clear the top-bar KPIs (notably the
+    /// monotonic "failed" count) between test sessions without having to
+    /// restart the controlcenter pod. Does NOT touch the on-disk event journal
+    /// or the live SSE tape — those keep their own history independently.
+    /// </summary>
+    public void ResetAll()
+    {
+        Interlocked.Exchange(ref _totalStarted, 0);
+        Interlocked.Exchange(ref _totalCompleted, 0);
+        Interlocked.Exchange(ref _totalFailed, 0);
+        Interlocked.Exchange(ref _totalBlocks, 0);
+        Interlocked.Exchange(ref _totalOriginalBytes, 0);
+        Interlocked.Exchange(ref _totalCompressedBytes, 0);
+        Interlocked.Exchange(ref _totalDcBytes, 0);
+        Interlocked.Exchange(ref _totalRefsFound, 0);
+        Interlocked.Exchange(ref _totalChunks, 0);
+        Interlocked.Exchange(ref _totalServerMs, 0);
+
+        Interlocked.Exchange(ref _integrityChecked, 0);
+        Interlocked.Exchange(ref _integrityMismatches, 0);
+        Interlocked.Exchange(ref _integrityDecompressFailures, 0);
+        Interlocked.Exchange(ref _integrityLastTsNs, 0);
+        _integrityLastDetail = null;
+
+        Interlocked.Exchange(ref _refRoundTripChecked, 0);
+        Interlocked.Exchange(ref _refRoundTripMismatches, 0);
+        Interlocked.Exchange(ref _refRoundTripFetchFailures, 0);
+        Interlocked.Exchange(ref _refRoundTripLastTsNs, 0);
+        _refRoundTripLastDetail = null;
+
+        _active.Clear();
+    }
+
     public Snapshot CurrentSnapshot()
     {
         var active = _active.Values.ToArray();
@@ -151,6 +219,11 @@ public sealed class JobAggregator
             IntegrityDecompressFailures: Interlocked.Read(ref _integrityDecompressFailures),
             IntegrityLastTsNs: Interlocked.Read(ref _integrityLastTsNs),
             IntegrityLastDetail: _integrityLastDetail,
+            RefRoundTripChecked: Interlocked.Read(ref _refRoundTripChecked),
+            RefRoundTripMismatches: Interlocked.Read(ref _refRoundTripMismatches),
+            RefRoundTripFetchFailures: Interlocked.Read(ref _refRoundTripFetchFailures),
+            RefRoundTripLastTsNs: Interlocked.Read(ref _refRoundTripLastTsNs),
+            RefRoundTripLastDetail: _refRoundTripLastDetail,
             ActiveJobs: active);
     }
 
@@ -170,5 +243,10 @@ public sealed class JobAggregator
         long IntegrityDecompressFailures,
         long IntegrityLastTsNs,
         string? IntegrityLastDetail,
+        long RefRoundTripChecked,
+        long RefRoundTripMismatches,
+        long RefRoundTripFetchFailures,
+        long RefRoundTripLastTsNs,
+        string? RefRoundTripLastDetail,
         ActiveJob[] ActiveJobs);
 }

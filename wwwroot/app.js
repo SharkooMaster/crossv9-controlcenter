@@ -56,18 +56,41 @@ async function refreshSnapshot() {
     const checkedEl = $("kpi_int_checked");
     const mismEl = $("kpi_int_mismatch");
     const decEl = $("kpi_int_decompress");
+    const rtEl = $("kpi_rt_mismatch");
     checkedEl.textContent = fmtNum(s.kpis.integrity_checked);
     mismEl.textContent = fmtNum(s.kpis.integrity_mismatches);
     decEl.textContent = fmtNum(s.kpis.integrity_decompress_failures);
+    // RefRoundTrip combines hash-mismatch + fetch-failure into a single
+    // "would decompress fail?" answer. Even one of either is enough to break
+    // the file, so display them concatenated like "12 + 3 fetch-fail".
+    const rtMism = s.kpis.refroundtrip_mismatches || 0;
+    const rtFetchFail = s.kpis.refroundtrip_fetch_failures || 0;
+    const rtChecked = s.kpis.refroundtrip_checked || 0;
+    if (rtEl) {
+      rtEl.textContent = rtFetchFail > 0
+        ? `${fmtNum(rtMism)} (${fmtNum(rtFetchFail)} fetch-fail)`
+        : fmtNum(rtMism);
+      rtEl.classList.toggle("err", rtMism > 0);
+      rtEl.classList.toggle("ok", rtMism === 0 && rtChecked > 0);
+    }
     mismEl.classList.toggle("err", (s.kpis.integrity_mismatches || 0) > 0);
     mismEl.classList.toggle("ok", (s.kpis.integrity_mismatches || 0) === 0 && (s.kpis.integrity_checked || 0) > 0);
     decEl.classList.toggle("err", (s.kpis.integrity_decompress_failures || 0) > 0);
     decEl.classList.toggle("ok", (s.kpis.integrity_decompress_failures || 0) === 0);
-    const lastDetail = s.kpis.integrity_last_detail;
-    const lastTs = s.kpis.integrity_last_ts_ns;
+    // Prefer the RefRoundTrip detail over the generic integrity detail when
+    // both are present — RefRoundTrip is the only check that catches the
+    // "(BucketId, BucketKey) resolves to different bytes than search saw" bug.
+    const rtLastDetail = s.kpis.refroundtrip_last_detail;
+    const rtLastTs = s.kpis.refroundtrip_last_ts_ns;
+    const lastDetail = rtLastDetail || s.kpis.integrity_last_detail;
+    const lastTs = rtLastTs || s.kpis.integrity_last_ts_ns;
     const lastEl = $("integrity_last");
-    if (lastDetail && lastTs) lastEl.textContent = `${fmtTs(lastTs)} · ${lastDetail}`;
-    else lastEl.textContent = "—";
+    if (lastDetail && lastTs) {
+      const label = rtLastDetail ? `RefRoundTrip ${rtLastDetail}` : lastDetail;
+      lastEl.textContent = `${fmtTs(lastTs)} · ${label}`;
+    } else {
+      lastEl.textContent = "—";
+    }
 
     $("subs").textContent = s.bus.sse_subscribers;
     $("journalBytes").textContent = fmtBytes(s.journal.bytes_written);
@@ -472,6 +495,37 @@ $("pauseBtn").addEventListener("click", () => {
   $("pauseBtn").textContent = tapePaused ? "resume" : "pause";
   $("pauseBtn").classList.toggle("paused", tapePaused);
 });
+
+// ── Reset stats button ────────────────────────────────────────────────
+// Zeroes the monotonic top-bar counters (started/completed/failed/integrity)
+// in-place. Without this the only way to clear a stale "failed: 42" left
+// over from an earlier OOM run was to restart the controlcenter pod.
+const resetBtn = $("resetStatsBtn");
+if (resetBtn) {
+  resetBtn.addEventListener("click", async () => {
+    if (!confirm("Reset all dashboard counters (started/completed/failed/integrity)?\n\nThis only clears the in-memory KPIs. The on-disk event journal and live tape are untouched.")) {
+      return;
+    }
+    const original = resetBtn.textContent;
+    resetBtn.disabled = true;
+    resetBtn.textContent = "resetting…";
+    try {
+      const r = await fetch("/api/reset", { method: "POST" });
+      if (!r.ok) {
+        alert("Reset failed: HTTP " + r.status);
+        return;
+      }
+      // Pull fresh snapshot immediately so the numbers visibly drop to 0.
+      await refreshSnapshot();
+      await refreshPulse();
+    } catch (e) {
+      alert("Reset failed: " + e);
+    } finally {
+      resetBtn.disabled = false;
+      resetBtn.textContent = original;
+    }
+  });
+}
 
 (async function init() {
   // Restore last selected view

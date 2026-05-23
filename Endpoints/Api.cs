@@ -46,12 +46,19 @@ public static class Api
                     integrity_decompress_failures = snap.IntegrityDecompressFailures,
                     integrity_last_ts_ns = snap.IntegrityLastTsNs,
                     integrity_last_detail = snap.IntegrityLastDetail,
+                    refroundtrip_checked = snap.RefRoundTripChecked,
+                    refroundtrip_mismatches = snap.RefRoundTripMismatches,
+                    refroundtrip_fetch_failures = snap.RefRoundTripFetchFailures,
+                    refroundtrip_last_ts_ns = snap.RefRoundTripLastTsNs,
+                    refroundtrip_last_detail = snap.RefRoundTripLastDetail,
                 },
                 journal = new
                 {
                     enqueued = journal.Enqueued,
                     written = journal.Written,
                     dropped = journal.Dropped,
+                    perf_enqueued = journal.PerfEnqueued,
+                    perf_dropped = journal.PerfDropped,
                     bytes_written = journal.BytesWritten,
                     directory = journal.JournalDirectory,
                 },
@@ -129,7 +136,7 @@ public static class Api
             catch (InvalidOperationException) { return Results.BadRequest(); }
         });
 
-        // ── Fleet runtime stats (per-pod heap / fragmentation / RSS) ───
+        // ── Fleet runtime stats (per-pod heap / fragmentation / RSS / threadpool / GC% / RocksDB) ─
         app.MapGet("/api/fleet", (RuntimeStatsStore store) =>
         {
             var fleet = store.CurrentFleet();
@@ -143,6 +150,8 @@ public static class Api
                 ts_unix_ms              = s.TsUnixMs,
                 age_sec                 = (now - s.UpdatedUtc).TotalSeconds,
                 error                   = s.Error,
+                process_uptime_sec      = s.ProcessUptimeSec,
+
                 heap_size_bytes         = s.HeapSizeBytes,
                 heap_committed_bytes    = s.HeapCommittedBytes,
                 heap_fragmented_bytes   = s.HeapFragmentedBytes,
@@ -157,11 +166,49 @@ public static class Api
                 gen0_collections        = s.Gen0Collections,
                 gen1_collections        = s.Gen1Collections,
                 gen2_collections        = s.Gen2Collections,
+                gc_pause_total_sec      = s.GcPauseTotalSec,
+                time_in_gc_pct          = s.TimeInGcPct,
+
                 rss_bytes               = s.RssBytes,
                 private_bytes           = s.PrivateBytes,
                 memory_load_bytes       = s.MemoryLoadBytes,
                 memory_load_threshold   = s.MemoryLoadThreshold,
                 native_overhead_bytes   = s.NativeOverheadBytes,
+
+                threadpool_workers_busy       = s.ThreadpoolWorkersBusy,
+                threadpool_workers_max        = s.ThreadpoolWorkersMax,
+                threadpool_workers_min        = s.ThreadpoolWorkersMin,
+                threadpool_completion_busy    = s.ThreadpoolCompletionBusy,
+                threadpool_completion_max     = s.ThreadpoolCompletionMax,
+                threadpool_completion_min     = s.ThreadpoolCompletionMin,
+                threadpool_queue_length       = s.ThreadpoolQueueLength,
+
+                open_fd_count                = s.OpenFdCount,
+                grpc_channel_cache_count     = s.GrpcChannelCacheCount,
+                grpc_client_cache_count      = s.GrpcClientCacheCount,
+
+                stage_stats                  = s.StageStats,
+
+                rocks_unique_chunks          = s.RocksUniqueChunks,
+                rocks_total_chunk_bytes      = s.RocksTotalChunkBytes,
+                rocks_total_buckets          = s.RocksTotalBuckets,
+                rocks_total_vectors          = s.RocksTotalVectors,
+                rocksdb_chunk                = s.RocksdbChunk,
+                rocksdb_bucket               = s.RocksdbBucket,
+
+                // Replication health — surfaced in the fleet table's
+                // "Replication" column. ring_size shows how many agents
+                // are visible to this cross/gateway pod; topology
+                // version + replication factor + write quorum let the
+                // operator spot config drift between pods.
+                ring_size                    = s.RingSize,
+                topology_version             = s.TopologyVersion,
+                replication_factor           = s.ReplicationFactor,
+                write_quorum                 = s.WriteQuorum,
+                vnodes_per_agent             = s.VnodesPerAgent,
+                rebalance_coordinator_enabled = s.RebalanceCoordinatorEnabled,
+                anti_entropy_enabled         = s.AntiEntropyEnabled,
+                anti_entropy_auto_repair     = s.AntiEntropyAutoRepair,
             }), _json);
         });
 
@@ -175,6 +222,18 @@ public static class Api
             return Results.Json(new { dropped }, _json);
         });
 
+        // ── Reset KPI counters (top-bar started/completed/failed, integrity,
+        //    ref-roundtrip, active in-flight set). The counters are in-memory
+        //    and monotonic, so without this they only zero when the pod
+        //    restarts — that's how 42 stale failures from an earlier OOM run
+        //    keep showing on the dashboard after `reset.sh` wipes the agents
+        //    but leaves the controlcenter pod alone. ──────────────────────────
+        app.MapPost("/api/reset", (JobAggregator agg) =>
+        {
+            agg.ResetAll();
+            return Results.Json(new { reset = true }, _json);
+        });
+
         // ── Per-pod history (rolling 1h at default cadence) ────────────
         app.MapGet("/api/fleet/{component}/{podOrIp}/history",
             (RuntimeStatsStore store, string component, string podOrIp, int? max) =>
@@ -185,9 +244,30 @@ public static class Api
                 ts_unix_ms              = s.TsUnixMs,
                 heap_size_bytes         = s.HeapSizeBytes,
                 heap_fragmented_bytes   = s.HeapFragmentedBytes,
+                heap_fragment_ratio     = s.HeapSizeBytes > 0
+                                            ? (double)s.HeapFragmentedBytes / s.HeapSizeBytes : 0.0,
                 rss_bytes               = s.RssBytes,
                 gen2_collections        = s.Gen2Collections,
                 native_overhead_bytes   = s.NativeOverheadBytes,
+                time_in_gc_pct          = s.TimeInGcPct,
+                threadpool_workers_busy = s.ThreadpoolWorkersBusy,
+                threadpool_queue_length = s.ThreadpoolQueueLength,
+                open_fd_count           = s.OpenFdCount,
+                grpc_channel_cache_count = s.GrpcChannelCacheCount,
+                rocks_total_chunk_bytes = s.RocksTotalChunkBytes,
+                rocks_total_vectors     = s.RocksTotalVectors,
+                // Aggregate RocksDB pressure indicators into single scalars so a
+                // history chart can plot one line per pressure dimension.
+                rocksdb_compaction_pending = (s.RocksdbChunk?.CompactionPending == true)
+                                          || (s.RocksdbBucket?.CompactionPending == true),
+                rocksdb_write_stopped     = (s.RocksdbChunk?.WriteStopped == true)
+                                          || (s.RocksdbBucket?.WriteStopped == true),
+                rocksdb_pending_compaction_bytes = (s.RocksdbChunk?.PendingCompactionBytes ?? 0)
+                                                 + (s.RocksdbBucket?.PendingCompactionBytes ?? 0),
+                rocksdb_l0_files          = (s.RocksdbChunk?.NumFilesPerLevel?.Length > 0
+                                                ? s.RocksdbChunk.NumFilesPerLevel[0] : 0)
+                                          + (s.RocksdbBucket?.NumFilesPerLevel?.Length > 0
+                                                ? s.RocksdbBucket.NumFilesPerLevel[0] : 0),
             }), _json);
         });
 
