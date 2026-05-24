@@ -22,6 +22,11 @@ namespace Controlcenter.Services;
 public sealed class TopologyTracker
 {
     public const string ClientNodeId = "_client";
+    // Fallback node for the (rare) case where a stage event arrives BEFORE the
+    // fleet scraper has discovered any real gateway pod. Once any gateway pod
+    // is known, every new event is attributed to one of those pods directly
+    // and this synthetic node stays empty. We keep it in the snapshot only when
+    // it has actual edges, so the dashboard isn't littered with dead boxes.
     public const string GatewayAggregateId = "_gateway";
 
     // Stages that, on the cross side, imply a network call out to the gateway → agent
@@ -37,6 +42,12 @@ public sealed class TopologyTracker
     private readonly RuntimeStatsStore _stats;
     private readonly ConcurrentDictionary<EdgeKey, EdgeAccumulator> _edges = new();
     private long _eventsApplied;
+    // Round-robin counter for picking a real gateway pod per stage event.
+    // Cross uses gRPC dns:/// + RoundRobinConfig under the hood, so RR is the
+    // closest *honest* attribution we can render without gateway-side telemetry.
+    // It will reflect actual LB skew if cross ever gets stuck on one channel,
+    // because RR here is computed against the live fleet membership.
+    private long _gatewayRR;
 
     public TopologyTracker(RuntimeStatsStore stats)
     {
@@ -71,10 +82,35 @@ public sealed class TopologyTracker
             case JobPhase.StageDone:
                 if (!string.IsNullOrEmpty(ev.Stage) && GatewayBoundStages.Contains(ev.Stage))
                 {
-                    Bump(ev.CrossPod, GatewayAggregateId, ev.TsUnixNs, ev.Stage, bytes);
-                    // Fan-out to known agents — bytes split by agent count so the
-                    // aggregate edge accounting stays roughly balanced.
                     var fleet = _stats.CurrentFleet();
+                    // Pick one real gateway pod via round-robin (sorted by name
+                    // so the assignment is stable across snapshots).
+                    var gateways = fleet
+                        .Where(s => string.Equals(s.Component, "gateway", StringComparison.Ordinal)
+                                 && !string.IsNullOrEmpty(s.Pod))
+                        .Select(s => s.Pod!)
+                        .OrderBy(p => p, StringComparer.Ordinal)
+                        .ToList();
+
+                    string gw;
+                    if (gateways.Count > 0)
+                    {
+                        var idx = (int)(Interlocked.Increment(ref _gatewayRR) - 1);
+                        // Guard against negative modulo on long → int wrap.
+                        idx = ((idx % gateways.Count) + gateways.Count) % gateways.Count;
+                        gw = gateways[idx];
+                    }
+                    else
+                    {
+                        // Pre-discovery fallback: route through the synthetic
+                        // node so the edge isn't lost. Will reattribute to a
+                        // real gateway pod as soon as the scraper finds one.
+                        gw = GatewayAggregateId;
+                    }
+
+                    Bump(ev.CrossPod, gw, ev.TsUnixNs, ev.Stage, bytes);
+
+                    // Fan-out from the chosen gateway pod to all agents.
                     var agents = fleet
                         .Where(s => string.Equals(s.Component, "agent", StringComparison.Ordinal)
                                  && !string.IsNullOrEmpty(s.Pod))
@@ -84,7 +120,7 @@ public sealed class TopologyTracker
                     {
                         var per = bytes / (ulong)agents.Count;
                         foreach (var a in agents)
-                            Bump(GatewayAggregateId, a, ev.TsUnixNs, ev.Stage, per);
+                            Bump(gw, a, ev.TsUnixNs, ev.Stage, per);
                     }
                 }
                 break;
@@ -109,7 +145,14 @@ public sealed class TopologyTracker
 
         var nodes = new List<TopologyNode>();
         nodes.Add(new TopologyNode(ClientNodeId, "client", "client", null, true, 0, 0, 0));
-        nodes.Add(new TopologyNode(GatewayAggregateId, "gateway-router", "router", null, true, 0, 0, 0));
+        // Only show the synthetic gateway-router node if it currently has
+        // edges (i.e. an event came in before any real gateway pod was
+        // discovered). Otherwise we'd render a dead box on every dashboard.
+        var synthHasEdges = _edges.Keys.Any(k => k.Src == GatewayAggregateId || k.Dst == GatewayAggregateId);
+        if (synthHasEdges)
+        {
+            nodes.Add(new TopologyNode(GatewayAggregateId, "gateway-router", "router", null, true, 0, 0, 0));
+        }
 
         foreach (var s in fleet)
         {

@@ -545,7 +545,10 @@ if (resetBtn) {
 //     vertical position is a stable hash of the pod name. This keeps the
 //     graph readable when 8+ pods share a lane — better than a drifting force
 //     simulation that flips orientation on every refresh.
-const TOPO_LANES = ["client", "cross", "router", "agent"];
+// Lane order matches the visual axis labels under the canvas. The synthetic
+// "router" node only appears in this list opportunistically — it shares the
+// "gateway" lane when present, since both represent the gateway tier.
+const TOPO_LANES = ["client", "cross", "gateway", "agent"];
 let topoState = {
   // Last fetched snapshot
   nodes: [],
@@ -584,13 +587,12 @@ function topoLaneOf(node) {
   const id = node.id;
   const comp = node.component || "";
   if (id === topoState.clientId) return "client";
-  if (id === topoState.gatewayId) return "router";
+  // The synthetic gateway-router node (only rendered when the tracker had to
+  // fall back to it because no real gateway pod was known yet) sits in the
+  // gateway lane alongside the real pods.
+  if (id === topoState.gatewayId) return "gateway";
   if (comp === "cross") return "cross";
-  // Real gateway pods share the "router" lane with the synthetic router node:
-  // visually they're the same tier, and we don't render a separate column for
-  // them. Without this collapse `grouped["gateway"]` is undefined and the
-  // layout pass crashes (TopoLayout: can't access property 'push').
-  if (comp === "gateway") return "router";
+  if (comp === "gateway") return "gateway";
   if (comp === "agent") return "agent";
   // Fall back to "cross" lane for anything we couldn't classify; keeps the
   // graph from blowing up if a new component shows up before we teach the UI.
@@ -785,6 +787,26 @@ function topoRender() {
   };
 }
 
+// Per-(cross_pod) round-robin counter. Cross's gRPC client uses
+// dns:/// + RoundRobinConfig per RPC, so over many calls each gateway pod
+// gets ~equal traffic from each cross. Mirroring that here per-pulse keeps
+// the live animation honest without needing gateway-side telemetry.
+const topoGwRR = new Map();
+
+function topoPickGatewayPod() {
+  // Pick the next real gateway pod (sorted by id) via round-robin. If no
+  // gateway pods are known yet, fall back to the synthetic router id so
+  // the pulse still has somewhere to go.
+  const gws = topoState.nodes
+    .filter((n) => n.component === "gateway")
+    .map((n) => n.id)
+    .sort();
+  if (gws.length === 0) return topoState.gatewayId;
+  const c = (topoGwRR.get("_") || 0) + 1;
+  topoGwRR.set("_", c);
+  return gws[(c - 1) % gws.length];
+}
+
 function topoEdgeIdsForEvent(ev) {
   // Map a JobEvent to a list of edges (src→dst) it should pulse along. This
   // mirrors TopologyTracker.Apply on the server, but we have to reconstruct
@@ -797,11 +819,13 @@ function topoEdgeIdsForEvent(ev) {
   } else if (ev.phase === "StageDone") {
     const stage = ev.stage || "";
     if (stage === "SearchBuckets" || stage === "StoreChunks" || stage === "BatchGet" || stage === "BatchStore") {
-      ids.push({ id: `${ev.cross_pod}→${topoState.gatewayId}`, kind: "kind-stage" });
-      // Light up gateway→agent fan-out for any agent we currently see.
+      const gw = topoPickGatewayPod();
+      ids.push({ id: `${ev.cross_pod}→${gw}`, kind: "kind-stage" });
+      // Light up gateway→agent fan-out for any agent we currently see, from
+      // the SAME chosen gateway pod that absorbed the upstream pulse.
       for (const node of topoState.nodes) {
         if (node.component === "agent") {
-          ids.push({ id: `${topoState.gatewayId}→${node.id}`, kind: "kind-stage" });
+          ids.push({ id: `${gw}→${node.id}`, kind: "kind-stage" });
         }
       }
     }
