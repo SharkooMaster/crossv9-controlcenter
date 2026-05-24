@@ -16,6 +16,7 @@
     <nav class="viewnav" id="viewNav">
       <button data-view="operator" class="active">operator</button>
       <button data-view="pulse">pulse</button>
+      <button data-view="topology">topology</button>
     </nav>
     <div class="indicators">
       <span class="dot" id="liveDot" title="live stream"></span>
@@ -237,6 +238,62 @@
       <div id="pulseTape" class="pulse-tape"></div>
     </section>
   </div><!-- /view-pulse -->
+
+  <div class="view view-topology" id="view-topology" hidden>
+    <div class="topo-shell">
+      <div class="topo-canvas-wrap">
+        <div class="topo-head">
+          <h2 class="topo-title">request-graph</h2>
+          <span class="topo-sub">
+            client → cross → gateway → agents · live pulses follow real events ·
+            edges weighted by bytes &amp; stage activity
+          </span>
+          <div class="topo-legend">
+            <span class="leg leg-client">client</span>
+            <span class="leg leg-cross">cross</span>
+            <span class="leg leg-gateway">gateway</span>
+            <span class="leg leg-router">router</span>
+            <span class="leg leg-agent">agent</span>
+          </div>
+        </div>
+
+        <div class="topo-canvas">
+          <svg id="topoSvg" preserveAspectRatio="xMidYMid meet"></svg>
+        </div>
+
+        <div class="topo-axis" id="topoAxis">
+          <span class="topo-axis-label">CLIENT</span>
+          <span class="topo-axis-label">CROSS</span>
+          <span class="topo-axis-label">ROUTER</span>
+          <span class="topo-axis-label">AGENTS</span>
+        </div>
+      </div>
+
+      <aside class="topo-side">
+        <div class="topo-sidebar-title">overview</div>
+        <p class="topo-sidebar-blurb">
+          Each circle is a live pod. Lines mark request flow, with thicker lines
+          and brighter pulses where more bytes have just moved. Hover any node
+          for runtime stats; click an edge to open its activity log.
+        </p>
+        <div class="topo-stats">
+          <div class="topo-stat"><span class="k">events tracked</span><span class="v" id="topoEventsApplied">—</span></div>
+          <div class="topo-stat"><span class="k">live pulses</span><span class="v" id="topoLivePulses">0</span></div>
+          <div class="topo-stat"><span class="k">nodes</span><span class="v" id="topoNodeCount">—</span></div>
+          <div class="topo-stat"><span class="k">edges</span><span class="v" id="topoEdgeCount">—</span></div>
+        </div>
+
+        <div class="topo-selection-card" id="topoSelectionCard">
+          <div class="topo-sel-eyebrow" id="topoSelKind">no selection</div>
+          <div class="topo-sel-title" id="topoSelTitle">click a node or edge</div>
+          <div class="topo-sel-meta" id="topoSelMeta"></div>
+          <div class="topo-sel-divider"></div>
+          <div class="topo-sel-section-label">activity</div>
+          <div class="topo-sel-tape" id="topoSelTape"></div>
+        </div>
+      </aside>
+    </div>
+  </div><!-- /view-topology -->
 
   <footer>
     <span>read-only operator console · single pod · drops events on overload, never blocks the compressor</span>

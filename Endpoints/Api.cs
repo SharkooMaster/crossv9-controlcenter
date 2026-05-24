@@ -228,10 +228,49 @@ public static class Api
         //    restarts — that's how 42 stale failures from an earlier OOM run
         //    keep showing on the dashboard after `reset.sh` wipes the agents
         //    but leaves the controlcenter pod alone. ──────────────────────────
-        app.MapPost("/api/reset", (JobAggregator agg) =>
+        app.MapPost("/api/reset", (JobAggregator agg, TopologyTracker topo) =>
         {
             agg.ResetAll();
+            topo.Reset();
             return Results.Json(new { reset = true }, _json);
+        });
+
+        // ── Topology snapshot (nodes + aggregate edges) ─────────────────
+        // The dashboard's topology view polls this every couple of seconds for
+        // structure and overlays live SSE events as travelling pulses. Edges
+        // are derived from the cross-side stage stream, so they're synthetic
+        // (we don't yet trace gateway↔agent RPCs at the wire), but they're an
+        // honest "where bytes flowed" map of the request graph.
+        app.MapGet("/api/topology", (TopologyTracker topo) =>
+        {
+            var snap = topo.Snapshot();
+            return Results.Json(new
+            {
+                now_unix_ms = snap.NowUnixMs,
+                events_applied = snap.EventsApplied,
+                client_node_id = TopologyTracker.ClientNodeId,
+                gateway_node_id = TopologyTracker.GatewayAggregateId,
+                nodes = snap.Nodes.Select(n => new
+                {
+                    id = n.Id,
+                    component = n.Component,
+                    label = n.ShortLabel,
+                    node = n.Node,
+                    alive = n.Alive,
+                    heap_bytes = n.HeapBytes,
+                    rss_bytes = n.RssBytes,
+                    gc_pct = n.GcPct,
+                }),
+                edges = snap.Edges.Select(e => new
+                {
+                    src = e.Src,
+                    dst = e.Dst,
+                    count = e.Count,
+                    bytes = e.Bytes,
+                    last_ts_ns = e.LastTsNs,
+                    last_stage = e.LastStage,
+                }),
+            }, _json);
         });
 
         // ── Per-pod history (rolling 1h at default cadence) ────────────

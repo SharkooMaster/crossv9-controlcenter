@@ -20,14 +20,16 @@ public sealed class JobEventReceiverService : JobEventService.JobEventServiceBas
     private readonly JobEventRingBuffer _ring;
     private readonly LiveBroadcaster _broadcaster;
     private readonly JobAggregator _agg;
+    private readonly TopologyTracker _topology;
 
     public JobEventReceiverService(JournalWriter journal, JobEventRingBuffer ring,
-        LiveBroadcaster broadcaster, JobAggregator agg)
+        LiveBroadcaster broadcaster, JobAggregator agg, TopologyTracker topology)
     {
         _journal = journal;
         _ring = ring;
         _broadcaster = broadcaster;
         _agg = agg;
+        _topology = topology;
     }
 
     public override async Task<PushAck> Push(IAsyncStreamReader<JobEvent> requestStream, ServerCallContext context)
@@ -44,6 +46,7 @@ public sealed class JobEventReceiverService : JobEventService.JobEventServiceBas
                 _ring.Add(ev);                          // ~tens of ns under brief lock
                 _broadcaster.Publish(ev);               // bounded TryWrite per subscriber
                 _agg.Apply(ev);                         // pure in-memory counters
+                _topology.Apply(ev);                    // derives client→cross/gateway/agent edges
                 if (_journal.TryEnqueue(ev)) persisted++;
             }
         }

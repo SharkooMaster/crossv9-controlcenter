@@ -289,7 +289,11 @@ function connectSse() {
     setTimeout(connectSse, 3000);
   };
   es.onmessage = (m) => {
-    try { pushTape(JSON.parse(m.data)); } catch (e) {}
+    try {
+      const ev = JSON.parse(m.data);
+      pushTape(ev);
+      topoOnEvent(ev);
+    } catch (e) {}
   };
 }
 
@@ -471,8 +475,10 @@ function switchView(name) {
   buttons.forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   document.getElementById("view-operator").hidden = name !== "operator";
   document.getElementById("view-pulse").hidden = name !== "pulse";
+  document.getElementById("view-topology").hidden = name !== "topology";
   try { localStorage.setItem("crossv9.view", name); } catch (_) {}
   if (name === "pulse") renderPulseTape();
+  if (name === "topology") topoOnShow();
 }
 
 document.querySelectorAll("#viewNav button").forEach((b) =>
@@ -527,17 +533,476 @@ if (resetBtn) {
   });
 }
 
+// ── Topology view ──────────────────────────────────────────────────────
+// Architecture:
+//   - The backend's /api/topology returns a node + edge snapshot. We poll it
+//     on a slow cadence (3s) — only the structure cares about that.
+//   - Live SSE events drive *pulses*: short-lived dots that travel from src→dst
+//     along an edge. The pulse list is rate-capped so a benchmark spike can't
+//     grind the canvas to 1 fps.
+//   - Layout is a manual column-based projection rather than d3-force: every
+//     node lives in its component's lane (CLIENT, CROSS, ROUTER, AGENTS), and
+//     vertical position is a stable hash of the pod name. This keeps the
+//     graph readable when 8+ pods share a lane — better than a drifting force
+//     simulation that flips orientation on every refresh.
+const TOPO_LANES = ["client", "cross", "router", "agent"];
+let topoState = {
+  // Last fetched snapshot
+  nodes: [],
+  edges: [],
+  clientId: "_client",
+  gatewayId: "_gateway",
+  // Layout cache: id → {x, y}
+  pos: new Map(),
+  // Scratch geometry: edge id ("src→dst") → SVG path d-attribute
+  edgePaths: new Map(),
+  // Live pulses currently animating: {id, edgeId, kind, startMs, durationMs}
+  pulses: [],
+  pulseSeq: 0,
+  // Currently selected node/edge for the sidebar
+  selection: { kind: null, id: null },
+  // Recent activity per edge / per node for the sidebar tape (newest first)
+  edgeTape: new Map(),     // edgeId → [{ts_ns, phase, body}]
+  nodeTape: new Map(),     // nodeId → [{ts_ns, phase, body}]
+  shown: false,
+  rafActive: false,
+  width: 0,
+  height: 0,
+};
+const TOPO_TAPE_MAX = 80;
+const TOPO_PULSE_MAX = 200;
+
+const TOPO_LANE_COLORS = {
+  client: "#f5b1ff",
+  cross: "#4cd0ff",
+  router: "#ffb454",
+  gateway: "#7a82ff",
+  agent: "#5fe89a",
+};
+
+function topoLaneOf(node) {
+  const id = node.id;
+  const comp = node.component || "";
+  if (id === topoState.clientId) return "client";
+  if (id === topoState.gatewayId) return "router";
+  if (comp === "cross" || comp === "gateway") return comp;
+  if (comp === "agent") return "agent";
+  // Fall back to "cross" lane for anything we couldn't classify; keeps the
+  // graph from blowing up if a new component shows up before we teach the UI.
+  return "cross";
+}
+
+function topoStableHash(s) {
+  // Cheap deterministic 0..1. Lets us put pods in stable vertical positions
+  // across reloads without depending on a force simulation seed.
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 10000) / 10000;
+}
+
+async function topoFetch() {
+  try {
+    const r = await fetch("/api/topology");
+    if (!r.ok) return;
+    const t = await r.json();
+    topoState.nodes = t.nodes || [];
+    topoState.edges = t.edges || [];
+    topoState.clientId = t.client_node_id;
+    topoState.gatewayId = t.gateway_node_id;
+    $("topoEventsApplied").textContent = fmtNum(t.events_applied);
+    $("topoNodeCount").textContent = fmtNum(topoState.nodes.length);
+    $("topoEdgeCount").textContent = fmtNum(topoState.edges.length);
+    topoLayout();
+    topoRender();
+    topoUpdateSelection();
+  } catch (e) { /* transient */ }
+}
+
+function topoLayout() {
+  const svg = $("topoSvg");
+  if (!svg) return;
+  const rect = svg.getBoundingClientRect();
+  const w = rect.width || 1200;
+  const h = rect.height || 540;
+  topoState.width = w;
+  topoState.height = h;
+  const padX = Math.min(140, w * 0.12);
+  const padY = 60;
+  const lanes = TOPO_LANES;
+  const laneCount = lanes.length;
+  const laneSpacing = (w - 2 * padX) / Math.max(1, laneCount - 1);
+
+  // Group nodes by lane to know how many vertical slots we need per lane.
+  const grouped = {};
+  for (const lane of lanes) grouped[lane] = [];
+  for (const node of topoState.nodes) {
+    const lane = topoLaneOf(node);
+    grouped[lane].push(node);
+  }
+  // Stable sort within a lane so successive renders don't shuffle nodes.
+  for (const lane of lanes) {
+    grouped[lane].sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  topoState.pos.clear();
+  lanes.forEach((lane, laneIdx) => {
+    const arr = grouped[lane];
+    const x = padX + laneIdx * laneSpacing;
+    if (arr.length === 1) {
+      topoState.pos.set(arr[0].id, { x, y: h / 2 });
+      return;
+    }
+    const usable = h - 2 * padY;
+    arr.forEach((node, i) => {
+      // Use stable hash to spread but keep order; helps when the lane has many
+      // pods and we want them roughly evenly spaced rather than crowding.
+      const base = arr.length > 1 ? i / (arr.length - 1) : 0.5;
+      const jitter = (topoStableHash(node.id) - 0.5) * 0.06; // ±3% wiggle
+      const y = padY + Math.max(0, Math.min(1, base + jitter)) * usable;
+      topoState.pos.set(node.id, { x, y });
+    });
+  });
+
+  // Pre-compute edge paths so animation lookups are O(1).
+  topoState.edgePaths.clear();
+  for (const e of topoState.edges) {
+    const p1 = topoState.pos.get(e.src);
+    const p2 = topoState.pos.get(e.dst);
+    if (!p1 || !p2) continue;
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const c1x = p1.x + dx * 0.45;
+    const c1y = p1.y;
+    const c2x = p1.x + dx * 0.55;
+    const c2y = p2.y;
+    const path = `M${p1.x.toFixed(1)},${p1.y.toFixed(1)} C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+    topoState.edgePaths.set(`${e.src}→${e.dst}`, { p1, p2, path });
+  }
+}
+
+function topoEdgeIntensity(e) {
+  // Returns a 0..1 weight used to light up "hot" edges. We treat anything that
+  // saw activity in the last 8s as fully hot, tapering off to zero by 30s.
+  if (!e.last_ts_ns) return 0;
+  const ageMs = (Date.now() * 1e6 - Number(e.last_ts_ns)) / 1e6;
+  if (ageMs < 8000) return 1;
+  if (ageMs > 30000) return 0;
+  return 1 - (ageMs - 8000) / 22000;
+}
+
+function topoRender() {
+  const svg = $("topoSvg");
+  if (!svg) return;
+  const w = topoState.width;
+  const h = topoState.height;
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+
+  // Build edge paths first so they sit *under* the nodes.
+  let edgesHtml = "";
+  for (const e of topoState.edges) {
+    const geom = topoState.edgePaths.get(`${e.src}→${e.dst}`);
+    if (!geom) continue;
+    const intensity = topoEdgeIntensity(e);
+    const cls = intensity > 0.6 ? "hot" : (intensity > 0 ? "" : "dim");
+    const sel = topoState.selection.kind === "edge" && topoState.selection.id === `${e.src}→${e.dst}`;
+    edgesHtml += `<path class="topo-edge ${cls} ${sel ? "selected" : ""}" d="${geom.path}" data-edge="${e.src}→${e.dst}"/>`;
+  }
+
+  // Render nodes.
+  let nodesHtml = "";
+  for (const node of topoState.nodes) {
+    const p = topoState.pos.get(node.id);
+    if (!p) continue;
+    const lane = topoLaneOf(node);
+    const sel = topoState.selection.kind === "node" && topoState.selection.id === node.id;
+    const dead = node.alive === false;
+    // Compute event throughput for the node's headline number — we count
+    // outgoing edges' "count" as a rough activity proxy.
+    let outCount = 0;
+    for (const e of topoState.edges) {
+      if (e.src === node.id) outCount += Number(e.count || 0);
+    }
+    const radius = 26;
+    const ringR = 36;
+    const labelMain = node.label || "?";
+    const kind = lane.toUpperCase();
+    const tooltip = `${node.id}\nnode: ${node.node || "—"}\nheap: ${fmtBytes(node.heap_bytes)}\nrss: ${fmtBytes(node.rss_bytes)}\ngc: ${(node.gc_pct || 0).toFixed(2)}%`;
+
+    nodesHtml += `
+      <g class="topo-node ${sel ? "selected" : ""} ${dead ? "dead" : ""}" data-node="${node.id}" transform="translate(${p.x.toFixed(1)},${p.y.toFixed(1)})">
+        <circle class="topo-node-ring ${dead ? "dead" : "alive"}" r="${ringR}"/>
+        <circle class="topo-node-bg ${lane}" r="${radius}">
+          <title>${tooltip.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</title>
+        </circle>
+        <text class="topo-node-count" y="-2">${outCount > 0 ? fmtNum(outCount) : "·"}</text>
+        <text class="topo-node-kind" y="12">${kind}</text>
+        <text class="topo-node-floatlabel" y="${ringR + 16}">${labelMain}</text>
+      </g>
+    `;
+  }
+
+  svg.innerHTML = `
+    <g id="topoEdgesLayer">${edgesHtml}</g>
+    <g id="topoNodesLayer">${nodesHtml}</g>
+    <g id="topoPulsesLayer"></g>
+  `;
+
+  // Wire up clicks. Delegated so a re-render doesn't lose handlers.
+  svg.onclick = (ev) => {
+    const node = ev.target.closest("[data-node]");
+    if (node) {
+      topoState.selection = { kind: "node", id: node.dataset.node };
+      topoRender();
+      topoUpdateSelection();
+      return;
+    }
+    const edge = ev.target.closest("[data-edge]");
+    if (edge) {
+      topoState.selection = { kind: "edge", id: edge.dataset.edge };
+      topoRender();
+      topoUpdateSelection();
+    }
+  };
+}
+
+function topoEdgeIdsForEvent(ev) {
+  // Map a JobEvent to a list of edges (src→dst) it should pulse along. This
+  // mirrors TopologyTracker.Apply on the server, but we have to reconstruct
+  // it client-side because pulses need to fire BEFORE the next /api/topology
+  // poll catches up with the server-side counters.
+  const ids = [];
+  if (!ev || !ev.cross_pod) return ids;
+  if (ev.phase === "Started") {
+    ids.push({ id: `${topoState.clientId}→${ev.cross_pod}`, kind: "kind-start" });
+  } else if (ev.phase === "StageDone") {
+    const stage = ev.stage || "";
+    if (stage === "SearchBuckets" || stage === "StoreChunks" || stage === "BatchGet" || stage === "BatchStore") {
+      ids.push({ id: `${ev.cross_pod}→${topoState.gatewayId}`, kind: "kind-stage" });
+      // Light up gateway→agent fan-out for any agent we currently see.
+      for (const node of topoState.nodes) {
+        if (node.component === "agent") {
+          ids.push({ id: `${topoState.gatewayId}→${node.id}`, kind: "kind-stage" });
+        }
+      }
+    }
+  } else if (ev.phase === "Completed") {
+    ids.push({ id: `${ev.cross_pod}→${topoState.clientId}`, kind: "kind-done" });
+  } else if (ev.phase === "Failed") {
+    ids.push({ id: `${ev.cross_pod}→${topoState.clientId}`, kind: "kind-error" });
+  }
+  return ids;
+}
+
+function topoSpawnPulse(edgeId, kindClass) {
+  const geom = topoState.edgePaths.get(edgeId);
+  if (!geom) return;
+  if (topoState.pulses.length > TOPO_PULSE_MAX) {
+    // Drop oldest. Trade truthful representation of every event for keeping
+    // the canvas at 60 fps during a benchmark.
+    topoState.pulses.shift();
+  }
+  topoState.pulses.push({
+    id: ++topoState.pulseSeq,
+    edgeId,
+    kindClass,
+    startMs: performance.now(),
+    durationMs: 700 + Math.random() * 200,
+  });
+  $("topoLivePulses").textContent = String(topoState.pulses.length);
+  if (!topoState.rafActive) {
+    topoState.rafActive = true;
+    requestAnimationFrame(topoTickPulses);
+  }
+}
+
+function topoTapeEntryFor(ev) {
+  let body = "";
+  let cls = "";
+  if (ev.phase === "Started") {
+    body = `${ev.mode || ""} ${fmtBytes(ev.original_size)} ${ev.file_name || ""}`.trim();
+  } else if (ev.phase === "StageDone") {
+    body = `${ev.stage || ""} ${fmtMs(ev.stage_ms)}`;
+  } else if (ev.phase === "Completed") {
+    body = `→ ${fmtBytes(ev.compressed_size)} · ${fmtNum(ev.refs_found)}refs · ${fmtMs(ev.wall_ms)}`;
+    cls = "ok";
+  } else if (ev.phase === "Failed") {
+    body = `${ev.error_class || "?"} ${(ev.error_message || "").substring(0, 60)}`;
+    cls = "err";
+  } else {
+    body = ev.phase;
+  }
+  return { ts_ns: ev.ts_ns, phase: ev.phase, body, cls };
+}
+
+function topoRecordTape(map, key, ev) {
+  let arr = map.get(key);
+  if (!arr) { arr = []; map.set(key, arr); }
+  arr.unshift(topoTapeEntryFor(ev));
+  if (arr.length > TOPO_TAPE_MAX) arr.length = TOPO_TAPE_MAX;
+}
+
+function topoOnEvent(ev) {
+  if (!ev) return;
+  // Always record into the per-edge / per-node tape so the sidebar has
+  // history even before the user opens the topology view.
+  const edges = topoEdgeIdsForEvent(ev);
+  for (const e of edges) topoRecordTape(topoState.edgeTape, e.id, ev);
+  if (ev.cross_pod) topoRecordTape(topoState.nodeTape, ev.cross_pod, ev);
+
+  if (!topoState.shown) return; // don't animate when the view isn't visible
+  for (const e of edges) topoSpawnPulse(e.id, e.kindClass);
+
+  // If selection is showing this edge/node, refresh the sidebar tape.
+  if (topoState.selection.kind === "edge" && edges.some((e) => e.id === topoState.selection.id)) {
+    topoUpdateSelection();
+  } else if (topoState.selection.kind === "node" && ev.cross_pod === topoState.selection.id) {
+    topoUpdateSelection();
+  }
+}
+
+function topoTickPulses(nowMs) {
+  const layer = document.getElementById("topoPulsesLayer");
+  if (!layer) {
+    topoState.rafActive = false;
+    return;
+  }
+  let html = "";
+  let alive = 0;
+  for (const p of topoState.pulses) {
+    const t = (nowMs - p.startMs) / p.durationMs;
+    if (t >= 1) continue;
+    const geom = topoState.edgePaths.get(p.edgeId);
+    if (!geom) continue;
+    // Linear interpolate along the bezier control polyline — close enough at
+    // a 60 fps tick to look like the pulse follows the curve.
+    const { p1, p2 } = geom;
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    // Smooth ease-out so pulses arrive softly.
+    const eased = 1 - Math.pow(1 - t, 2);
+    const x = p1.x + dx * eased;
+    const y = p1.y + dy * eased;
+    const r = 4.5;
+    html += `<circle class="topo-pulse ${p.kindClass}" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}"/>`;
+    alive++;
+  }
+  layer.innerHTML = html;
+  // Filter out finished pulses to keep memory steady.
+  if (alive !== topoState.pulses.length) {
+    topoState.pulses = topoState.pulses.filter((p) => (nowMs - p.startMs) < p.durationMs);
+    $("topoLivePulses").textContent = String(topoState.pulses.length);
+  }
+  if (topoState.pulses.length > 0) {
+    requestAnimationFrame(topoTickPulses);
+  } else {
+    topoState.rafActive = false;
+  }
+}
+
+function topoUpdateSelection() {
+  const sel = topoState.selection;
+  if (!sel.kind) {
+    $("topoSelKind").textContent = "no selection";
+    $("topoSelTitle").textContent = "click a node or edge";
+    $("topoSelMeta").textContent = "";
+    $("topoSelTape").innerHTML = `<div class="empty">nothing selected</div>`;
+    return;
+  }
+  if (sel.kind === "node") {
+    const node = topoState.nodes.find((n) => n.id === sel.id);
+    if (!node) return;
+    $("topoSelKind").textContent = `node · ${(node.component || "?")}`;
+    $("topoSelTitle").textContent = node.label || node.id;
+    let outCount = 0, inCount = 0, outBytes = 0, inBytes = 0;
+    for (const e of topoState.edges) {
+      if (e.src === node.id) { outCount += Number(e.count || 0); outBytes += Number(e.bytes || 0); }
+      if (e.dst === node.id) { inCount += Number(e.count || 0); inBytes += Number(e.bytes || 0); }
+    }
+    $("topoSelMeta").innerHTML = `
+      <div>id: ${node.id}</div>
+      <div>k8s node: ${node.node || "—"}</div>
+      <div>heap: ${fmtBytes(node.heap_bytes)} · rss: ${fmtBytes(node.rss_bytes)} · gc ${(node.gc_pct || 0).toFixed(2)}%</div>
+      <div>in: ${fmtNum(inCount)} ev · ${fmtBytes(inBytes)}</div>
+      <div>out: ${fmtNum(outCount)} ev · ${fmtBytes(outBytes)}</div>
+      <div>state: ${node.alive ? "alive" : "stale/dead"}</div>
+    `;
+    const tape = topoState.nodeTape.get(node.id) || [];
+    $("topoSelTape").innerHTML = topoRenderTape(tape);
+    return;
+  }
+  if (sel.kind === "edge") {
+    const [src, dst] = sel.id.split("→");
+    const edge = topoState.edges.find((e) => e.src === src && e.dst === dst);
+    if (!edge) {
+      $("topoSelKind").textContent = "edge";
+      $("topoSelTitle").textContent = sel.id;
+      $("topoSelMeta").textContent = "no aggregate stats yet";
+      $("topoSelTape").innerHTML = `<div class="empty">no events recorded on this edge yet</div>`;
+      return;
+    }
+    $("topoSelKind").textContent = "edge";
+    $("topoSelTitle").textContent = `${src} → ${dst}`;
+    const ageMs = edge.last_ts_ns ? ((Date.now() * 1e6 - Number(edge.last_ts_ns)) / 1e6) : null;
+    $("topoSelMeta").innerHTML = `
+      <div>events: ${fmtNum(edge.count)}</div>
+      <div>bytes: ${fmtBytes(edge.bytes)}</div>
+      <div>last stage: ${edge.last_stage || "—"}</div>
+      <div>last seen: ${ageMs == null ? "never" : (ageMs < 1000 ? "just now" : (ageMs / 1000).toFixed(0) + "s ago")}</div>
+    `;
+    const tape = topoState.edgeTape.get(sel.id) || [];
+    $("topoSelTape").innerHTML = topoRenderTape(tape);
+  }
+}
+
+function topoRenderTape(arr) {
+  if (!arr || arr.length === 0) {
+    return `<div class="empty">no events recorded yet</div>`;
+  }
+  return arr.map((r) => {
+    const phase = (r.phase || "").replace(/([a-z])([A-Z])/g, "$1_$2").toUpperCase();
+    return `<div class="row ${r.cls || ""}"><span class="ts">${fmtTs(r.ts_ns)}</span><span class="ph">${phase}</span><span class="body">${r.body}</span></div>`;
+  }).join("");
+}
+
+function topoOnShow() {
+  topoState.shown = true;
+  // First time the user opens the view, do a full layout pass so the SVG
+  // gets sized against the now-visible container.
+  topoLayout();
+  topoRender();
+  topoUpdateSelection();
+}
+
+window.addEventListener("resize", () => {
+  if (!topoState.shown) return;
+  topoLayout();
+  topoRender();
+});
+
+// ── Bootstrap ──────────────────────────────────────────────────────────
 (async function init() {
   // Restore last selected view
   try {
     const last = localStorage.getItem("crossv9.view");
-    if (last === "pulse" || last === "operator") switchView(last);
+    if (last === "pulse" || last === "operator" || last === "topology") switchView(last);
   } catch (_) {}
 
-  await Promise.all([loadInitialTape(), refreshSnapshot(), refreshPulse(), refreshFiles(), refreshFleet()]);
+  await Promise.all([
+    loadInitialTape(),
+    refreshSnapshot(),
+    refreshPulse(),
+    refreshFiles(),
+    refreshFleet(),
+    topoFetch(),
+  ]);
   connectSse();
   setInterval(refreshSnapshot, 2000);
   setInterval(refreshPulse, 2000);
   setInterval(refreshFiles, 15000);
   setInterval(refreshFleet, 10000);
+  setInterval(topoFetch, 3000);
 })();
+

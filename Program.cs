@@ -16,6 +16,10 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<JournalWriter>());
 builder.Services.AddSingleton<JobEventRingBuffer>(_ => new JobEventRingBuffer(2000));
 builder.Services.AddSingleton<LiveBroadcaster>();
 builder.Services.AddSingleton<JobAggregator>();
+// Topology graph: keeps a rolling map of node↔node edges built from job-event
+// flow, surfaced via /api/topology and animated by the SSE pulses on the
+// dashboard's topology view.
+builder.Services.AddSingleton<TopologyTracker>();
 
 // Pull-based fleet health: the scraper resolves headless service DNS for
 // agent / cross / gateway and hits each pod's /stats/runtime every 30 s.
