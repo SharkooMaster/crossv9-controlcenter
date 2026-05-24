@@ -585,7 +585,12 @@ function topoLaneOf(node) {
   const comp = node.component || "";
   if (id === topoState.clientId) return "client";
   if (id === topoState.gatewayId) return "router";
-  if (comp === "cross" || comp === "gateway") return comp;
+  if (comp === "cross") return "cross";
+  // Real gateway pods share the "router" lane with the synthetic router node:
+  // visually they're the same tier, and we don't render a separate column for
+  // them. Without this collapse `grouped["gateway"]` is undefined and the
+  // layout pass crashes (TopoLayout: can't access property 'push').
+  if (comp === "gateway") return "router";
   if (comp === "agent") return "agent";
   // Fall back to "cross" lane for anything we couldn't classify; keeps the
   // graph from blowing up if a new component shows up before we teach the UI.
@@ -639,7 +644,15 @@ function topoLayout() {
   const grouped = {};
   for (const lane of lanes) grouped[lane] = [];
   for (const node of topoState.nodes) {
-    const lane = topoLaneOf(node);
+    let lane = topoLaneOf(node);
+    // Defensive: if a future component returns an unknown lane name, drop it
+    // into "cross" rather than crashing the whole render pass. The console
+    // warning makes the misclassification easy to find when adding a new
+    // component type.
+    if (!grouped[lane]) {
+      console.warn(`[topology] unknown lane "${lane}" for node id=${node.id} component=${node.component}; bucketing into cross`);
+      lane = "cross";
+    }
     grouped[lane].push(node);
   }
   // Stable sort within a lane so successive renders don't shuffle nodes.
@@ -728,7 +741,11 @@ function topoRender() {
     const radius = 26;
     const ringR = 36;
     const labelMain = node.label || "?";
-    const kind = lane.toUpperCase();
+    // The kind label shows what the pod actually IS, not the lane it lives in.
+    // Real gateway pods sit in the "router" lane next to the synthetic router
+    // node, but should still display "GATEWAY" so operators can tell them
+    // apart at a glance.
+    const kind = (node.component || lane).toUpperCase();
     const tooltip = `${node.id}\nnode: ${node.node || "—"}\nheap: ${fmtBytes(node.heap_bytes)}\nrss: ${fmtBytes(node.rss_bytes)}\ngc: ${(node.gc_pct || 0).toFixed(2)}%`;
 
     nodesHtml += `
