@@ -83,6 +83,48 @@ public static class Api
             }, _json);
         });
 
+        // ── Saturation time series ──────────────────────────────────────
+        // Three cumulative lines — ingested / stored-on-DC / returned-to-customer
+        // — plus a summary whose headline number is the *marginal* store rate
+        // (Δstored ÷ Δingested over the most recent slice of ingest). That's the
+        // signal that tells you whether the global dictionary is saturating:
+        // it should fall well below the overall store ratio (and toward 0) as
+        // similar data accumulates.
+        app.MapGet("/api/saturation", (SaturationSampler sat, int? max) =>
+        {
+            var samples = sat.Snapshot(Math.Clamp(max ?? 1500, 2, 6000));
+            var last = samples.Count > 0 ? samples[^1] : default;
+            long totIn = last.BytesIn, totDc = last.BytesDc, totOut = last.BytesOut;
+
+            double marginal = ComputeMarginalStoreRate(samples, out long windowIn, out long windowDc);
+
+            return Results.Json(new
+            {
+                samples = samples.Select(s => new
+                {
+                    ts_ms = s.TsMs,
+                    bytes_in = s.BytesIn,
+                    bytes_dc = s.BytesDc,
+                    bytes_out = s.BytesOut,
+                    chunks = s.Chunks,
+                    refs = s.Refs,
+                }),
+                summary = new
+                {
+                    bytes_in = totIn,
+                    bytes_dc = totDc,
+                    bytes_out = totOut,
+                    store_ratio = totIn > 0 ? (double)totDc / totIn : 0.0,    // dc ÷ ingested (overall)
+                    return_ratio = totIn > 0 ? (double)totOut / totIn : 0.0,  // ccf ÷ ingested (overall)
+                    leverage = totDc > 0 ? (double)totIn / totDc : 0.0,       // logical ÷ physical
+                    marginal_store_rate = marginal,                          // recent Δdc ÷ Δin
+                    marginal_window_in = windowIn,
+                    marginal_window_dc = windowDc,
+                    sample_count = samples.Count,
+                },
+            }, _json);
+        });
+
         // ── Recent events (live tape, oldest first) ────────────────────
         app.MapGet("/api/events/recent", (JobEventRingBuffer ring, int? max) =>
         {
@@ -228,10 +270,11 @@ public static class Api
         //    restarts — that's how 42 stale failures from an earlier OOM run
         //    keep showing on the dashboard after `reset.sh` wipes the agents
         //    but leaves the controlcenter pod alone. ──────────────────────────
-        app.MapPost("/api/reset", (JobAggregator agg, TopologyTracker topo) =>
+        app.MapPost("/api/reset", (JobAggregator agg, TopologyTracker topo, SaturationSampler sat) =>
         {
             agg.ResetAll();
             topo.Reset();
+            sat.Reset();
             return Results.Json(new { reset = true }, _json);
         });
 
@@ -313,6 +356,38 @@ public static class Api
         // ── Health ─────────────────────────────────────────────────────
         app.MapGet("/health", () => Results.Ok("ok"));
         app.MapGet("/ready", () => Results.Ok("ready"));
+    }
+
+    /// <summary>
+    /// Marginal store rate = Δstored ÷ Δingested across the trailing slice of the
+    /// series that covers roughly the last 20% of ingested bytes (at least the last
+    /// 8 samples). Measuring against an ingest delta — not wall-clock — keeps it
+    /// robust to idle gaps. Returns 0 when there isn't enough movement yet.
+    /// </summary>
+    private static double ComputeMarginalStoreRate(
+        List<SaturationSampler.Sample> s, out long windowIn, out long windowDc)
+    {
+        windowIn = 0; windowDc = 0;
+        if (s.Count < 2) return 0.0;
+
+        long totIn = s[^1].BytesIn;
+        if (totIn <= 0) return 0.0;
+
+        long targetSpan = (long)(totIn * 0.20);
+        int minBack = Math.Min(8, s.Count - 1);
+        int idx = s.Count - 1;
+        int back = 0;
+        for (int i = s.Count - 2; i >= 0; i--)
+        {
+            idx = i;
+            back++;
+            if ((totIn - s[i].BytesIn) >= targetSpan && back >= minBack) break;
+        }
+
+        windowIn = s[^1].BytesIn - s[idx].BytesIn;
+        windowDc = s[^1].BytesDc - s[idx].BytesDc;
+        if (windowDc < 0) windowDc = 0;
+        return windowIn > 0 ? (double)windowDc / windowIn : 0.0;
     }
 
     private static object SerializeEvent(JobEvent ev) => new

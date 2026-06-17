@@ -475,9 +475,11 @@ function switchView(name) {
   buttons.forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   document.getElementById("view-operator").hidden = name !== "operator";
   document.getElementById("view-pulse").hidden = name !== "pulse";
+  document.getElementById("view-saturation").hidden = name !== "saturation";
   document.getElementById("view-topology").hidden = name !== "topology";
   try { localStorage.setItem("crossv9.view", name); } catch (_) {}
   if (name === "pulse") renderPulseTape();
+  if (name === "saturation") refreshSaturation();
   if (name === "topology") topoOnShow();
 }
 
@@ -493,6 +495,134 @@ async function refreshPulse() {
     const s = await r.json();
     renderPulse(s);
   } catch (e) { /* ignore */ }
+}
+
+// ── Saturation view ────────────────────────────────────────────────────
+async function refreshSaturation() {
+  try {
+    const r = await fetch("/api/saturation");
+    if (!r.ok) return;
+    const d = await r.json();
+    renderSaturation(d);
+  } catch (e) { /* ignore transient errors */ }
+}
+
+function renderSaturation(d) {
+  const sum = d.summary || {};
+  $("satIn").textContent = fmtBytes(sum.bytes_in);
+  $("satDc").textContent = fmtBytes(sum.bytes_dc);
+  $("satOut").textContent = fmtBytes(sum.bytes_out);
+  $("satStoreRatio").textContent = fmtRatio(sum.store_ratio);
+  $("satMarginal").textContent = (sum.marginal_window_in || 0) > 0 ? fmtRatio(sum.marginal_store_rate) : "—";
+  $("satLeverage").textContent = (sum.leverage || 0) > 0 ? sum.leverage.toFixed(2) + "×" : "—";
+
+  $("satVerdict").innerHTML = saturationVerdict(sum);
+
+  const samples = d.samples || [];
+  drawCumulativeChart(samples);
+  drawMarginalChart(samples, sum);
+}
+
+function saturationVerdict(sum) {
+  const store = sum.store_ratio || 0;
+  const marg = sum.marginal_store_rate || 0;
+  const hasWindow = (sum.marginal_window_in || 0) > 0;
+  if (!sum.bytes_in) {
+    return "Waiting for data — run an ingest to begin charting the saturation curve.";
+  }
+  if (!hasWindow) {
+    return `<span class="muted">Building dictionary.</span> Stored <b>${fmtBytes(sum.bytes_dc)}</b> for <b>${fmtBytes(sum.bytes_in)}</b> ingested (<b>${fmtRatio(store)}</b>). Not enough movement yet to estimate the marginal rate.`;
+  }
+  const perGb = fmtBytes(marg * 1024 * 1024 * 1024);
+  if (marg < store * 0.6 && marg < 0.5) {
+    return `<span class="ok">Saturating.</span> The most recent ingest added only <b>${fmtRatio(marg)}</b> to physical storage versus <b>${fmtRatio(store)}</b> overall — every new GB ingested now costs ~<b>${perGb}</b> on disk. The dictionary is paying off; the curve should keep flattening.`;
+  }
+  if (marg < 0.85) {
+    return `<span class="warn">Warming up.</span> Marginal storage is <b>${fmtRatio(marg)}</b> (overall <b>${fmtRatio(store)}</b>). Some cross-data reuse is happening — feed more similar data to drive it toward zero.`;
+  }
+  return `<span class="muted">Cold dictionary.</span> Still storing <b>${fmtRatio(marg)}</b> of new data — expected on a first ingest into an empty store. Re-run a similar dataset <em>without wiping</em> to test whether the marginal rate drops.`;
+}
+
+// Build an SVG polyline from {x,y} points (viewBox coordinates).
+function satPolyline(pts, cls) {
+  if (!pts.length) return "";
+  const d = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  return `<polyline class="${cls}" points="${d}" fill="none" />`;
+}
+
+function drawCumulativeChart(samples) {
+  const svg = $("satChart");
+  const empty = $("satChartEmpty");
+  if (!svg) return;
+  if (samples.length < 2) {
+    svg.innerHTML = "";
+    if (empty) empty.style.display = "";
+    return;
+  }
+  if (empty) empty.style.display = "none";
+
+  const W = 1000, H = 320, padL = 6, padR = 6, padT = 12, padB = 16;
+  const xMin = samples[0].ts_ms, xMax = samples[samples.length - 1].ts_ms;
+  const yMax = Math.max(1, ...samples.map((s) => s.bytes_in));
+  const sx = (t) => padL + (xMax > xMin ? (t - xMin) / (xMax - xMin) : 0) * (W - padL - padR);
+  const sy = (v) => H - padB - (v / yMax) * (H - padT - padB);
+  const line = (acc, cls) => satPolyline(samples.map((s) => ({ x: sx(s.ts_ms), y: sy(acc(s)) })), cls);
+
+  let grid = "";
+  for (let g = 0; g <= 4; g++) {
+    const yy = padT + (g / 4) * (H - padT - padB);
+    const val = yMax * (1 - g / 4);
+    grid += `<line class="sat-grid" x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}"/>`;
+    grid += `<text class="sat-grid-lbl" x="${padL + 3}" y="${(yy - 3).toFixed(1)}">${fmtBytes(val)}</text>`;
+  }
+
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML =
+    grid +
+    line((s) => s.bytes_in, "sat-line in") +
+    line((s) => s.bytes_dc, "sat-line dc") +
+    line((s) => s.bytes_out, "sat-line out");
+}
+
+function drawMarginalChart(samples, sum) {
+  const svg = $("satMarginalChart");
+  if (!svg) return;
+
+  // Pointwise marginal Δstored/Δingested with light EMA smoothing; skip idle
+  // intervals where no new bytes were ingested.
+  const pts = [];
+  let ema = null;
+  for (let i = 1; i < samples.length; i++) {
+    const din = samples[i].bytes_in - samples[i - 1].bytes_in;
+    if (din <= 0) continue;
+    let m = (samples[i].bytes_dc - samples[i - 1].bytes_dc) / din;
+    if (m < 0) m = 0;
+    ema = ema == null ? m : ema * 0.7 + m * 0.3;
+    pts.push({ ts: samples[i].ts_ms, m: ema });
+  }
+  if (pts.length < 2) { svg.innerHTML = ""; return; }
+
+  const W = 1000, H = 180, padL = 6, padR = 6, padT = 14, padB = 14;
+  const xMin = pts[0].ts, xMax = pts[pts.length - 1].ts;
+  const yMax = Math.max(1.0, ...pts.map((p) => p.m)); // baseline ceiling = 100%
+  const sx = (t) => padL + (xMax > xMin ? (t - xMin) / (xMax - xMin) : 0) * (W - padL - padR);
+  const sy = (v) => H - padB - (Math.min(v, yMax) / yMax) * (H - padT - padB);
+
+  let extra = "";
+  // 100% reference (store everything).
+  const y1 = sy(1.0);
+  extra += `<line class="sat-grid" x1="${padL}" y1="${y1.toFixed(1)}" x2="${W - padR}" y2="${y1.toFixed(1)}"/>`;
+  extra += `<text class="sat-grid-lbl" x="${padL + 3}" y="${(y1 - 3).toFixed(1)}">100% · store all</text>`;
+  // Overall store ratio reference.
+  const ref = sum.store_ratio || 0;
+  if (ref > 0 && ref <= yMax) {
+    const yy = sy(ref);
+    extra += `<line class="sat-ref" x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}"/>`;
+    extra += `<text class="sat-grid-lbl" x="${W - padR - 4}" y="${(yy - 4).toFixed(1)}" text-anchor="end">overall ${fmtRatio(ref)}</text>`;
+  }
+
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = extra + satPolyline(pts.map((p) => ({ x: sx(p.ts), y: sy(p.m) })), "sat-line marg");
 }
 
 // ── Wire up ────────────────────────────────────────────────────────────
@@ -524,6 +654,7 @@ if (resetBtn) {
       // Pull fresh snapshot immediately so the numbers visibly drop to 0.
       await refreshSnapshot();
       await refreshPulse();
+      await refreshSaturation();
     } catch (e) {
       alert("Reset failed: " + e);
     } finally {
@@ -1028,7 +1159,7 @@ window.addEventListener("resize", () => {
   // Restore last selected view
   try {
     const last = localStorage.getItem("crossv9.view");
-    if (last === "pulse" || last === "operator" || last === "topology") switchView(last);
+    if (last === "pulse" || last === "operator" || last === "topology" || last === "saturation") switchView(last);
   } catch (_) {}
 
   await Promise.all([
@@ -1045,5 +1176,8 @@ window.addEventListener("resize", () => {
   setInterval(refreshFiles, 15000);
   setInterval(refreshFleet, 10000);
   setInterval(topoFetch, 3000);
+  setInterval(() => {
+    if (!document.getElementById("view-saturation").hidden) refreshSaturation();
+  }, 5000);
 })();
 

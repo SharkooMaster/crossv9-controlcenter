@@ -21,6 +21,12 @@ builder.Services.AddSingleton<JobAggregator>();
 // dashboard's topology view.
 builder.Services.AddSingleton<TopologyTracker>();
 
+// Saturation history: samples the cumulative ingested / stored / returned totals
+// into a bounded time series (default every 5 s, ring of 4096) so the dashboard's
+// saturation view can chart whether physical storage growth flattens over time.
+builder.Services.AddSingleton<SaturationSampler>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SaturationSampler>());
+
 // Pull-based fleet health: the scraper resolves headless service DNS for
 // agent / cross / gateway and hits each pod's /stats/runtime every 30 s.
 // Workload pods don't push anything; if this scraper is offline they're

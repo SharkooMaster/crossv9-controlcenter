@@ -16,6 +16,7 @@
     <nav class="viewnav" id="viewNav">
       <button data-view="operator" class="active">operator</button>
       <button data-view="pulse">pulse</button>
+      <button data-view="saturation">saturation</button>
       <button data-view="topology">topology</button>
     </nav>
     <div class="indicators">
@@ -238,6 +239,44 @@
       <div id="pulseTape" class="pulse-tape"></div>
     </section>
   </div><!-- /view-pulse -->
+
+  <div class="view view-saturation" id="view-saturation" hidden>
+    <section class="sat-summary">
+      <div class="sat-card"><div class="sat-k">ingested</div><div class="sat-v mono" id="satIn">—</div><div class="sat-sub">original bytes received</div></div>
+      <div class="sat-card"><div class="sat-k">stored on dc</div><div class="sat-v mono" id="satDc">—</div><div class="sat-sub">physical bytes we keep</div></div>
+      <div class="sat-card"><div class="sat-k">returned to customers</div><div class="sat-v mono" id="satOut">—</div><div class="sat-sub">ccf handed back</div></div>
+      <div class="sat-card"><div class="sat-k">store ratio</div><div class="sat-v mono" id="satStoreRatio">—</div><div class="sat-sub">dc ÷ ingested · lower is better</div></div>
+      <div class="sat-card hl"><div class="sat-k">marginal store rate</div><div class="sat-v mono" id="satMarginal">—</div><div class="sat-sub">Δstored ÷ Δingested · recent</div></div>
+      <div class="sat-card"><div class="sat-k">storage leverage</div><div class="sat-v mono" id="satLeverage">—</div><div class="sat-sub">logical ÷ physical</div></div>
+    </section>
+
+    <section class="panel sat-verdict-panel">
+      <div class="sat-verdict" id="satVerdict">waiting for data…</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>cumulative volume</h2>
+        <span class="hint">ingested vs stored vs returned over time — saturation shows as the stored line bending away from ingested</span>
+        <span class="spacer"></span>
+        <span class="sat-legend">
+          <span class="sat-leg in">ingested</span>
+          <span class="sat-leg dc">stored on dc</span>
+          <span class="sat-leg out">returned</span>
+        </span>
+      </div>
+      <div class="sat-chart-wrap"><svg id="satChart" preserveAspectRatio="none"></svg></div>
+      <div id="satChartEmpty" class="empty">no data yet — run a compression to populate the curve</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>marginal storage rate</h2>
+        <span class="hint">new physical bytes stored per byte ingested — trends toward 0 as the global dictionary saturates</span>
+      </div>
+      <div class="sat-chart-wrap small"><svg id="satMarginalChart" preserveAspectRatio="none"></svg></div>
+    </section>
+  </div><!-- /view-saturation -->
 
   <div class="view view-topology" id="view-topology" hidden>
     <div class="topo-shell">
