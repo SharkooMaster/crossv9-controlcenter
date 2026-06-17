@@ -55,10 +55,32 @@ public sealed class SaturationSampler : BackgroundService
     private void RecordOnce()
     {
         var s = _agg.CurrentSnapshot();
+
+        // Fold in live in-flight progress. The cumulative job counters only
+        // advance on COMPLETED, so a single large file (one long-running job
+        // that streams thousands of blocks) would otherwise leave the series
+        // flat at zero until the very end. Each active job accumulates per-block
+        // BytesIn / DcBytes / BytesOut, so adding those makes the curve fill in
+        // continuously during the run. There's a tiny discontinuity at the
+        // moment a job completes (its block-summed BytesIn is swapped for the
+        // exact OriginalSize), but it's negligible for a saturation trend.
+        long liveIn = s.TotalOriginalBytes;
+        long liveDc = s.TotalDcBytes;
+        long liveOut = s.TotalCompressedBytes;
+        long chunks = s.TotalChunks;
+        long refs = s.TotalRefsFound;
+        foreach (var j in s.ActiveJobs)
+        {
+            liveIn += j.BytesIn;
+            liveDc += j.DcBytes;
+            liveOut += j.BytesOut;
+            chunks += j.Chunks;
+            refs += j.RefsFound;
+        }
+
         var sample = new Sample(
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            s.TotalOriginalBytes, s.TotalDcBytes, s.TotalCompressedBytes,
-            s.TotalChunks, s.TotalRefsFound);
+            liveIn, liveDc, liveOut, chunks, refs);
 
         lock (_lock)
         {
